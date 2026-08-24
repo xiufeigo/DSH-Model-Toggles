@@ -116,9 +116,10 @@ settings.yaml 里的 `model-toggles:` 段，以及模型条目里由插件写入
 src/capabilities.ts   纯逻辑：efforts 形状 / 有效状态 / 合并（接管、受管关闭、幂等、不复活）
 src/index.ts          Host：RPC（meta.routes / caps.get / caps.set）+ 影子段 + 调和引擎
 src/client/inject.ts  DOM 注入层（aria-label/类名子串锚点，防御式、幂等）
-src/client/index.tsx  浏览器半边：目录/能力缓存 + MutationObserver + 远程事件
+src/client/index.tsx  浏览器半边：按路由完整能力快照缓存 + token 失效保护 + MutationObserver
 scripts/smoke.mjs     冒烟：两个 bundle 真实求值 + 逻辑单测 + RPC 写入/收敛/复活防护直测
 scripts/dom-test.mjs  jsdom 集成：按官方编辑器真实 DOM 形状直测注入与上报
+scripts/client-state-test.mjs 两模型同路由状态回归：事件失效 + caps.set 不得截断缓存
 scripts/verify-live.mjs 重启后一键活实例验证（只读）
 scripts/install.mjs   安装器（构建+冒烟+junction+patch 行+HTTP 验证）
 scripts/uninstall.mjs 卸载器（patch 行+junction）
@@ -129,15 +130,17 @@ scripts/uninstall.mjs 卸载器（patch 行+junction）
 ```
 pnpm build          # tsdown 双面构建（host ESM + client CJS + 纯逻辑产物）
 pnpm typecheck      # tsc --noEmit
-pnpm verify         # 冒烟 21 项（含 RPC 写入/收敛/复活防护）
-pnpm test:dom       # jsdom DOM 集成 7 项
-pnpm test           # typecheck + verify + test:dom 三连
-pnpm verify:live    # 活实例只读验证（需 DSH 已重启加载本插件）
+pnpm verify            # 冒烟 21 项（含 RPC 写入/收敛/复活防护）
+pnpm test:dom          # jsdom DOM 集成 7 项
+pnpm test:client-state # 两模型同路由缓存回归（防止「勾一个另一个失效」）
+pnpm test              # typecheck + verify + test:dom + test:client-state 四连
+pnpm verify:live       # 活实例只读验证（需 DSH 已重启加载本插件）
 ```
 
 自测期间发现并修复过的真实问题（回归测试均在案）：dataset 连字符属性名
 （浏览器会抛异常）、注入层全局 document 依赖、调和器「复活」被删除路由/模型的
-缺陷。
+缺陷，以及同一路由单模型 `caps.set` 响应截断完整能力缓存、导致「勾一个另一个
+失效」的竞态。
 
 规范要点：host 半边硬 inject `webServer`（冷启动等就绪）、settings 走
 `ctx.inject(['settings'])` 可选依赖；`@deepseek-ai/*` 与 `@earendil-works/pi-ai`

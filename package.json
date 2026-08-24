@@ -26,7 +26,8 @@
     "typecheck": "tsc --noEmit",
     "verify": "node scripts/smoke.mjs",
     "test:dom": "node scripts/dom-test.mjs",
-    "test": "pnpm run typecheck && pnpm run verify && pnpm run test:dom",
+    "test:client-state": "node scripts/client-state-test.mjs",
+    "test": "pnpm run typecheck && pnpm run verify && pnpm run test:dom && pnpm run test:client-state",
     "verify:live": "node scripts/verify-live.mjs",
     "plugin:install": "node scripts/install.mjs",
     "plugin:uninstall": "node scripts/uninstall.mjs"
@@ -46,12 +47,5 @@
     "tsdown": "^0.22.0",
     "typescript": "^5.6.0"
   },
-  "license": "MIT",
-  "pnpm": {
-    "onlyBuiltDependencies": [],
-    "ignoredBuiltDependencies": [
-      "@google/genai",
-      "protobufjs"
-    ]
-  }
+  "license": "MIT"
 }

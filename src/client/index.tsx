@@ -31,6 +31,10 @@ interface CapsGetResponse extends RpcEnvelopeResponse {
 interface CapsSetResponse extends RpcEnvelopeResponse {
 	effective?: EffectiveCapability
 }
+interface CapsRequest {
+	token: number
+	promise: Promise<Map<string, EffectiveCapability> | undefined>
+}
 interface RpcEnvelopeResponse {
 	ok?: boolean
 	error?: string
@@ -49,7 +53,9 @@ export function apply(ctx: ClientContext): void {
 
 	const directory = { direct: new Set<string>(), byName: new Map<string, string>() }
 	const capsCache = new Map<string, Map<string, EffectiveCapability>>()
-	const capsInFlight = new Map<string, Promise<Map<string, EffectiveCapability> | undefined>>()
+	/** 每条路由最多一个当前请求；旧 token 的慢响应不得覆盖新状态。 */
+	const capsInFlight = new Map<string, CapsRequest>()
+	const capsTokens = new Map<string, number>()
 	const toggleQueues = new Map<string, Promise<void>>()
 
 	let scanTimer: ReturnType<typeof setTimeout> | undefined
@@ -80,20 +86,59 @@ export function apply(ctx: ClientContext): void {
 		directory.byName = byName
 	}
 
-	const requestCaps = (route: string): void => {
-		let inflight = capsInFlight.get(route)
-		if (inflight === undefined) {
-			inflight = rpc<CapsGetResponse>('caps.get', { route }).then(response => {
-				const map = new Map<string, EffectiveCapability>()
-				for (const [modelId, caps] of Object.entries(response.models ?? {})) {
-					map.set(modelId, caps)
-				}
-				if (response.ok) capsCache.set(route, map)
-				return response.ok ? map : undefined
-			})
-			capsInFlight.set(route, inflight)
+	/**
+	 * 让一条路由的能力快照失效。必须同时移除 cache 与 inflight：之前只清
+	 * cache 会复用一个已经完成的 promise，结果永远不再回填完整 map；随后
+	 * 单模型 caps.set 的响应把 route map 截断成一个模型，正是「勾一个另一个
+	 * 失效」的根因。
+	 */
+	const invalidateCaps = (route?: string): void => {
+		const routes = route === undefined
+			? new Set([...capsCache.keys(), ...capsInFlight.keys(), ...capsTokens.keys()])
+			: new Set([route])
+		for (const key of routes) {
+			capsCache.delete(key)
+			capsInFlight.delete(key)
+			capsTokens.set(key, (capsTokens.get(key) ?? 0) + 1)
 		}
-		void inflight.then(() => scheduleScan())
+	}
+
+	/**
+	 * 读取一条路由的完整能力 map。force 会废弃当前 map 并发起新请求；token
+	 * 防止较早的慢响应回写过期数据。返回完整 map，绝不以 caps.set 的单模型
+	 * response 充当 route 缓存。
+	 */
+	const requestCaps = (route: string, force = false): Promise<Map<string, EffectiveCapability> | undefined> => {
+		if (!force) {
+			const cached = capsCache.get(route)
+			if (cached !== undefined) return Promise.resolve(cached)
+			const active = capsInFlight.get(route)
+			if (active !== undefined) return active.promise
+		} else {
+			// 保留 token 递增语义，同时不让旧缓存把其他模型短暂刷成错误状态。
+			capsCache.delete(route)
+		}
+
+		const token = (capsTokens.get(route) ?? 0) + 1
+		capsTokens.set(route, token)
+		const promise = rpc<CapsGetResponse>('caps.get', { route }).then(response => {
+			if (!response.ok) return undefined
+			const map = new Map<string, EffectiveCapability>()
+			for (const [modelId, caps] of Object.entries(response.models ?? {})) {
+				map.set(modelId, caps)
+			}
+			if (capsTokens.get(route) === token) capsCache.set(route, map)
+			return map
+		}).catch(error => {
+			console.warn(`dsh-model-toggles: ${route} 能力状态读取失败`, error)
+			return undefined
+		}).finally(() => {
+			const active = capsInFlight.get(route)
+			if (active?.token === token) capsInFlight.delete(route)
+		})
+		capsInFlight.set(route, { token, promise })
+		void promise.then(() => scheduleScan())
+		return promise
 	}
 
 	const hooks: ToggleHooks = {
@@ -111,11 +156,9 @@ export function apply(ctx: ClientContext): void {
 					console.warn(`dsh-model-toggles: ${route}/${model} 写入失败：${response.error ?? '未知错误'}`)
 					return
 				}
-				if (response.effective !== undefined) {
-					const map = capsCache.get(route) ?? new Map<string, EffectiveCapability>()
-					map.set(model, response.effective)
-					capsCache.set(route, map)
-				}
+				// caps.set 只回当前模型，绝不能拿它拼一份 route map：那会让同一路由
+				// 的其余模型在缓存中消失。写成功后强制拉完整路由快照。
+				await requestCaps(route, true)
 			})
 			toggleQueues.set(key, run.catch(() => {}))
 			void run.then(scheduleScan)
@@ -123,12 +166,12 @@ export function apply(ctx: ClientContext): void {
 	}
 
 	// 事件：settings 任何段变更都可能是「官方保存覆盖了我们的字段 → 调和补回」，
-	// 清缓存重扫以复位勾选状态。
+	// 失效完整快照（含已完成 promise）后重扫，避免单模型响应截断 route map。
 	const offDocumentUpdated = ((): (() => void) | undefined => {
 		try {
 			if (typeof ctx.remote?.$on !== 'function') return undefined
 			return ctx.remote.$on('settings/document-updated', () => {
-				capsCache.clear()
+				invalidateCaps()
 				void refreshMeta().then(scheduleScan)
 			})
 		} catch {

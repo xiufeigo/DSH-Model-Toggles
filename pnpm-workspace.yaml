@@ -1,3 +1,4 @@
+# 这些依赖不参与本插件的构建/运行；明确拒绝其可选构建脚本，避免 pnpm 交互提示。
 allowBuilds:
-  '@google/genai': set this to true or false
-  protobufjs: set this to true or false
+  '@google/genai': false
+  protobufjs: false
