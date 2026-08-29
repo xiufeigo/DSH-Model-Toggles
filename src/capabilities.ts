@@ -27,6 +27,9 @@ export interface ModelEntry {
 	name?: string
 	input?: string[]
 	reasoningEfforts?: Record<string, string | null>
+	contextWindow?: number
+	maxTokens?: number
+	compat?: Record<string, unknown>
 	[key: string]: unknown
 }
 

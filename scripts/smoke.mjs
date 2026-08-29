@@ -350,6 +350,92 @@ try {
     if (llmCalls.length !== 0) throw new Error(`reconcile on event should converge to no-op, got ${llmCalls.length}`)
     ok('rpc: settings/updated 事件触发调和且无差异收敛')
   }
+  {
+    // 回归（上下文窗口丢失）：currentUserEntriesOf 必须保留非受管字段。
+    // 旧实现只回填 id/input/reasoningEfforts/name，调和器以「剥字段读」整写
+    // models 数组，把用户在官方编辑器里保存的 contextWindow / maxTokens /
+    // compat 一并抹掉。
+    const entries = entry.currentUserEntriesOf(
+      { demo: { models: [{ id: 'm1', name: 'M1', contextWindow: 983000, maxTokens: 131000, compat: { a: 1 }, custom: { b: [1, 2] } }] } },
+      'demo',
+    )
+    const row = entries[0]
+    if (row === undefined) throw new Error('entry missing')
+    if (row.contextWindow !== 983000 || row.maxTokens !== 131000) throw new Error(`capacity fields lost: ${JSON.stringify(row)}`)
+    if (JSON.stringify(row.compat) !== '{"a":1}' || JSON.stringify(row.custom) !== '{"b":[1,2]}') throw new Error(`opaque fields lost: ${JSON.stringify(row)}`)
+    ok('host: currentUserEntriesOf 保留非受管字段（contextWindow / maxTokens / compat / 自定义）')
+  }
+  {
+    // 回归（上下文窗口丢失·勾选路径）：同路由勾选触发的立即调和，整写 models
+    // 数组时其他模型（及同模型）的 contextWindow / maxTokens 必须原样保留。
+    mutateCalls.length = 0
+    const scoped = makeStatefulSettings(
+      { providers: { demo: { models: [
+        { id: 'm1', name: 'M1', contextWindow: 983000, maxTokens: 131000, compat: { a: 1 }, input: ['text'] },
+        { id: 'm2', contextWindow: 1000000, maxTokens: 64000 },
+      ] } } },
+      { providers: { demo: { m1: { image: true, efforts: ['high'] } } } },
+    )
+    const outcome = await entry.reconcileRoutes({
+      routes: ['demo'],
+      shadow: entry.readShadowProviders(scoped),
+      providers: entry.readUserProviders(scoped),
+      settings: scoped,
+      allowCreate: true,
+    })
+    if (outcome.ok !== true || outcome.changedRoutes.length !== 1) throw new Error(`toggle reconcile should write once: ${JSON.stringify(outcome)}`)
+    const written = mutateCalls.filter(call => call.ns === 'llm-pi-ai')[0]?.ops[0]?.value
+    if (!Array.isArray(written)) throw new Error('no models array written')
+    const w1 = written.find(row => row.id === 'm1')
+    const w2 = written.find(row => row.id === 'm2')
+    if (w1?.contextWindow !== 983000 || w1?.maxTokens !== 131000 || w1?.name !== 'M1' || JSON.stringify(w1?.compat) !== '{"a":1}') {
+      throw new Error(`m1 non-managed fields lost on toggle write: ${JSON.stringify(w1)}`)
+    }
+    if (JSON.stringify(w1.input) !== JSON.stringify(['text', 'image']) || JSON.stringify(w1.reasoningEfforts) !== JSON.stringify({ off: null, high: 'high' })) {
+      throw new Error(`m1 managed fields wrong: ${JSON.stringify(w1)}`)
+    }
+    if (w2?.contextWindow !== 1000000 || w2?.maxTokens !== 64000) {
+      throw new Error(`m2 capacity fields lost on toggle write: ${JSON.stringify(w2)}`)
+    }
+    // 收敛：紧接的第二次调和（事件驱动兜底）不得再写。
+    mutateCalls.length = 0
+    await entry.reconcileRoutes({
+      routes: ['demo'],
+      shadow: entry.readShadowProviders(scoped),
+      providers: entry.readUserProviders(scoped),
+      settings: scoped,
+      allowCreate: false,
+    })
+    if (mutateCalls.some(call => call.ns === 'llm-pi-ai')) throw new Error('follow-up event reconcile should converge to no-op')
+    ok('reconcile: 勾选调和写回保留 contextWindow / maxTokens / compat（上下文窗口丢失回归）')
+  }
+  {
+    // 回归（上下文窗口丢失·修复路径）：官方编辑器用过期数组覆盖受管字段后
+    // （input / reasoningEfforts 消失、contextWindow 仍在），事件调和的修复写
+    // 必须补回受管字段且不丢容量字段。
+    mutateCalls.length = 0
+    const scoped = makeStatefulSettings(
+      { providers: { demo: { models: [{ id: 'm1', name: 'M1', contextWindow: 983000, maxTokens: 131000 }] } } },
+      { providers: { demo: { m1: { image: true, efforts: ['high'] } } } },
+    )
+    const outcome = await entry.reconcileRoutes({
+      routes: ['demo'],
+      shadow: entry.readShadowProviders(scoped),
+      providers: entry.readUserProviders(scoped),
+      settings: scoped,
+      allowCreate: false,
+    })
+    if (outcome.ok !== true || outcome.changedRoutes.length !== 1) throw new Error(`repair reconcile should write once: ${JSON.stringify(outcome)}`)
+    const written = mutateCalls.filter(call => call.ns === 'llm-pi-ai')[0]?.ops[0]?.value
+    const w1 = written?.find(row => row.id === 'm1')
+    if (JSON.stringify(w1?.input) !== JSON.stringify(['text', 'image']) || JSON.stringify(w1?.reasoningEfforts) !== JSON.stringify({ off: null, high: 'high' })) {
+      throw new Error(`repair should restore managed fields: ${JSON.stringify(w1)}`)
+    }
+    if (w1?.contextWindow !== 983000 || w1?.maxTokens !== 131000 || w1?.name !== 'M1') {
+      throw new Error(`repair write lost non-managed fields: ${JSON.stringify(w1)}`)
+    }
+    ok('reconcile: 官方过期数组覆盖后的修复写保留非受管字段（上下文窗口丢失回归）')
+  }
 } catch (error) {
   fail('Host 半边', error)
 }

@@ -201,6 +201,12 @@ export function currentUserEntriesOf(providers: Record<string, unknown>, route: 
 		const record = asRecord(raw)
 		if (record === undefined || typeof record.id !== 'string' || record.id.length === 0) continue
 		const entry: ModelEntry = { id: record.id }
+		// 保留除受管字段外的所有原样字段（上下文窗口、最大输出、compat 等），
+		// 避免勾选调和时丢失用户在官方编辑器里设置的 contextWindow / maxTokens。
+		for (const [key, value] of Object.entries(record)) {
+			if (key === 'id' || key === 'input' || key === 'reasoningEfforts' || key === 'name') continue
+			;(entry as Record<string, unknown>)[key] = value
+		}
 		if (Array.isArray(record.input)) entry.input = record.input.filter((row): row is string => typeof row === 'string')
 		if (record.reasoningEfforts !== null && typeof record.reasoningEfforts === 'object' && !Array.isArray(record.reasoningEfforts)) {
 			const efforts: Record<string, string | null> = {}
