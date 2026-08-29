@@ -121,6 +121,7 @@ scripts/smoke.mjs     冒烟：两个 bundle 真实求值 + 逻辑单测 + RPC �
 scripts/dom-test.mjs  jsdom 集成：按官方编辑器真实 DOM 形状直测注入与上报
 scripts/client-state-test.mjs 两模型同路由状态回归：事件失效 + caps.set 不得截断缓存
 scripts/verify-live.mjs 重启后一键活实例验证（只读）
+scripts/check-shadow.mjs 影子段核对：解析 settings.yaml，报告指向不存在路由/模型的无效键
 scripts/install.mjs   安装器（构建+冒烟+junction+patch 行+HTTP 验证）
 scripts/uninstall.mjs 卸载器（patch 行+junction）
 ```
@@ -139,8 +140,9 @@ pnpm verify:live       # 活实例只读验证（需 DSH 已重启加载本插�
 
 自测期间发现并修复过的真实问题（回归测试均在案）：dataset 连字符属性名
 （浏览器会抛异常）、注入层全局 document 依赖、调和器「复活」被删除路由/模型的
-缺陷，以及同一路由单模型 `caps.set` 响应截断完整能力缓存、导致「勾一个另一个
-失效」的竞态。
+缺陷，同一路由单模型 `caps.set` 响应截断完整能力缓存、导致「勾一个另一个
+失效」的竞态，以及调和器读条目时剥掉非受管字段、整写 models 数组把用户在
+官方编辑器保存的 contextWindow / maxTokens 一并抹掉的「上下文窗口丢失」。
 
 规范要点：host 半边硬 inject `webServer`（冷启动等就绪）、settings 走
 `ctx.inject(['settings'])` 可选依赖；`@deepseek-ai/*` 与 `@earendil-works/pi-ai`
