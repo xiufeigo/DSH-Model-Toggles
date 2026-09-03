@@ -6,12 +6,13 @@ DSH 双面插件：把「模型能力勾选」做进官方**「设置 → 模型
 
 - **[图片输入]**：勾选 → 该模型条目写入 `input: ["text","image"]`；取消 → 删除
   `input` 字段（继承内置目录/默认值）。
-- **思考强度**（低 / 中 / 高 / 超高 / 最高 → `low / medium / high / xhigh / max`）：
+- **思考强度**（最低 / 低 / 中 / 高 / 超高 / 最高 →
+  `minimal / low / medium / high / xhigh / max`）：
   勾选任意档位 → 写入 `reasoningEfforts: { off:, low: low, … }`；全部取消 → 删除
   该字段。
 
 这两项本来就是 dsh-llm-pi-ai 原生支持的配置（`input` 模态与 `reasoningEfforts`
-思考档位），只是官方 UI 没暴露、只能手改 `settings.yaml`。本插件把勾选动作
+思考档位；`minimal` 档自 DSH 0.1.1-rc.2 / pi-ai 0.82 起可用），只是官方 UI 没暴露、只能手改 `settings.yaml`。本插件把勾选动作
 自动化：**勾一下立即写盘**（settings 原子写 + schema 校验 + 热重载），
 无需点官方「保存」，模型选择器里该模型的图文能力与思考档位即时生效。
 
@@ -21,6 +22,8 @@ DSH 双面插件：把「模型能力勾选」做进官方**「设置 → 模型
 勾选 ──▶ caps.set ──▶ ① 写影子段（settings.yaml 的 model-toggles:）
                       ② 立即调和 ──▶ 写 llm-pi-ai.providers.<route>.models（原子）
 官方编辑器保存 ──▶ settings 变更事件 ──▶ 兜底调和（几十 ms 内补回勾选字段）
+                                    └─▶ 顺手清理影子段：已删模型/路由的影子键自动移除
+启动 ──▶ 调和 + 清理各一次（修复历史覆盖、清掉旧版本遗留的无效影子键）
 ```
 
 勾选状态的**事实源**是插件自己的 settings 段（`model-toggles.providers.<route>.<model>`），
@@ -95,11 +98,14 @@ settings.yaml 里的 `model-toggles:` 段，以及模型条目里由插件写入
 - 取消勾选 = **受管关闭**：影子层写 `image: false` / `efforts: []`，调和时删除
   对应字段 —— 不是「恢复原样」，而是「确保无此能力」。想彻底回到「跟随内置
   目录」，删掉影子段对应键即可让字段随默认值。
-- **不复活删除**：只有显式勾选（caps.set 的立即调和，`allowCreate=true`）才允许
-  创建缺失条目/接管目录；`llm-pi-ai` 变更触发的事件调和
-  （`allowCreate=false`）只修改仍在列表里的条目——你在官方编辑器里删除的路由/
-  模型绝不会被插件加回来。反向：重新添加同 id 的模型时，之前勾选过的能力
-  会自动恢复（影子段按模型 id 记忆）。
+- **不复活删除，影子随删自动清**：事件驱动的兜底调和在引擎层缺省
+  `allowCreate=false`（调用方漏传也绝不复活）；只有显式勾选（caps.set 的立即
+  调和，`allowCreate=true` 且 `createIds` 限定为本次勾选的目标）才允许创建缺失
+  条目/接管目录。官方编辑器里删除模型/路由后，每次调和（事件驱动与启动各一次）
+  都会**自动清理**对应影子键——路由被删清整段、模型不在显式列表清单键、空覆盖
+  一并清；无显式 `models:` 列表的路由（跟随内置目录）无法凭列表判定删除，非空
+  影子键保留。影子段因此无需人工维护；代价是重新添加同 id 模型时不再恢复之前
+  的勾选（记忆已随删除自动清理）。
 - `off` 档位恒写入为 `off:`（null = 支持关闭思考、不发参数）：一旦声明任何思考
   档位，若不保留 off，该模型将无法显式关闭思考。
 - 勾选目标 = 条目在**已保存**配置里的模型 id；官方编辑器里临时改名/新增的
@@ -113,7 +119,8 @@ settings.yaml 里的 `model-toggles:` 段，以及模型条目里由插件写入
 ## 结构
 
 ```
-src/capabilities.ts   纯逻辑：efforts 形状 / 有效状态 / 合并（接管、受管关闭、幂等、不复活）
+src/capabilities.ts   纯逻辑：efforts 形状 / 有效状态 / 合并（接管、受管关闭、幂等、
+                      不复活）/ 影子段清理计划（随删自动清、目录路由不误清）
 src/index.ts          Host：RPC（meta.routes / caps.get / caps.set）+ 影子段 + 调和引擎
 src/client/inject.ts  DOM 注入层（aria-label/类名子串锚点，防御式、幂等）
 src/client/index.tsx  浏览器半边：按路由完整能力快照缓存 + token 失效保护 + MutationObserver
@@ -131,7 +138,7 @@ scripts/uninstall.mjs 卸载器（patch 行+junction）
 ```
 pnpm build          # tsdown 双面构建（host ESM + client CJS + 纯逻辑产物）
 pnpm typecheck      # tsc --noEmit
-pnpm verify            # 冒烟 21 项（含 RPC 写入/收敛/复活防护）
+pnpm verify            # 冒烟 30 项（含 RPC 写入/收敛/复活防护/影子自动清理）
 pnpm test:dom          # jsdom DOM 集成 7 项
 pnpm test:client-state # 两模型同路由缓存回归（防止「勾一个另一个失效」）
 pnpm test              # typecheck + verify + test:dom + test:client-state 四连
@@ -140,9 +147,11 @@ pnpm verify:live       # 活实例只读验证（需 DSH 已重启加载本插�
 
 自测期间发现并修复过的真实问题（回归测试均在案）：dataset 连字符属性名
 （浏览器会抛异常）、注入层全局 document 依赖、调和器「复活」被删除路由/模型的
-缺陷，同一路由单模型 `caps.set` 响应截断完整能力缓存、导致「勾一个另一个
-失效」的竞态，以及调和器读条目时剥掉非受管字段、整写 models 数组把用户在
-官方编辑器保存的 contextWindow / maxTokens 一并抹掉的「上下文窗口丢失」。
+缺陷（含事件调和漏传 `allowCreate` 被当成 true、官方编辑器每次保存都会把影子段
+里已删除的模型按裸条目复活的接线 bug），同一路由单模型 `caps.set` 响应截断完整
+能力缓存、导致「勾一个另一个失效」的竞态，以及调和器读条目时剥掉非受管字段、
+整写 models 数组把用户在官方编辑器保存的 contextWindow / maxTokens 一并抹掉的
+「上下文窗口丢失」。
 
 规范要点：host 半边硬 inject `webServer`（冷启动等就绪）、settings 走
 `ctx.inject(['settings'])` 可选依赖；`@deepseek-ai/*` 与 `@earendil-works/pi-ai`

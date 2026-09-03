@@ -122,6 +122,28 @@ try {
     if (noCreate.changed !== false || noCreate.entries.length !== 1) throw new Error(`event reconcile must not create entries: ${JSON.stringify(noCreate)}`)
     ok('capabilities.mergeCapabilityEntries：allowCreate=false 不接管、不复活')
   }
+  {
+    // 影子段自动清理（纯逻辑）：路由已删 → 整段；模型不在显式列表 → 单键；
+    // 无 models 列表（目录 passthrough）→ 保留；空覆盖 → 清；清空的段 → 连路由键。
+    const plan = caps.pruneShadowProviders({
+      shadow: {
+        gone: { m1: { image: true } },
+        demo: { m1: { image: true }, ghost: { image: true }, empty: {} },
+        cat: { m1: { image: true } },
+      },
+      providers: {
+        demo: { models: [{ id: 'm1' }] },
+        cat: {},
+      },
+    })
+    if (JSON.stringify(plan.unsetRoutes) !== JSON.stringify(['gone'])) throw new Error(`unsetRoutes wrong: ${JSON.stringify(plan.unsetRoutes)}`)
+    const demoUnset = plan.unsetModels.filter(row => row.route === 'demo').map(row => row.model).sort()
+    if (JSON.stringify(demoUnset) !== JSON.stringify(['empty', 'ghost'])) throw new Error(`demo unset wrong: ${JSON.stringify(plan.unsetModels)}`)
+    if (plan.unsetModels.some(row => row.route === 'cat')) throw new Error(`catalog route keys must stay: ${JSON.stringify(plan.unsetModels)}`)
+    if (plan.next.demo?.m1 === undefined || plan.next.cat?.m1 === undefined) throw new Error(`next tree wrong: ${JSON.stringify(plan.next)}`)
+    if (plan.next.gone !== undefined || plan.unsetModels.some(row => row.route === 'gone')) throw new Error('gone route must be fully dropped')
+    ok('capabilities.pruneShadowProviders：删路由清整段、删模型清单键、目录路由保留')
+  }
 } catch (error) {
   fail('纯逻辑层', error)
 }
@@ -169,8 +191,11 @@ try {
       },
       async mutate(ns, ops) {
         mutateCalls.push({ ns, ops })
-        const section = ns === 'llm-pi-ai' ? state.llm : state.shadow
+        // 逐条顺序应用：每条 op 都基于前一条的结果（真实 settings 服务语义）。
+        // 旧实现把 section 固定在循环外，第二条 op 会基于旧树应用、冲掉前一条
+        // 的 unset —— 多 op mutate（影子段清理）正是在这里露馅。
         for (const op of ops) {
+          const section = ns === 'llm-pi-ai' ? state.llm : state.shadow
           const next = applyOp(section, op)
           if (ns === 'llm-pi-ai') state.llm = next
           else state.shadow = next
@@ -231,7 +256,10 @@ try {
         shadow: entry.readShadowProviders(fakeSettings),
         providers: entry.readUserProviders(fakeSettings),
         settings: fakeSettings,
-        ...(options?.allowCreate === undefined ? {} : { allowCreate: options.allowCreate }),
+        ...(options === undefined ? {} : {
+          allowCreate: options.allowCreate === true,
+          ...(options.createIds === undefined ? {} : { createIds: options.createIds }),
+        }),
       }),
     },
   })
@@ -325,6 +353,43 @@ try {
     ok('reconcile: 被删条目在事件调和下不复活')
   }
   {
+    // 复活防护 C（复活 bug 回归·引擎缺省）：真实事件链路调 reconcile 时不传
+    // allowCreate —— 旧实现把 undefined 当 true，官方编辑器保存删掉的模型被
+    // 影子段立刻复活。引擎缺省必须等价 allowCreate=false。
+    mutateCalls.length = 0
+    const outcome = await entry.reconcileRoutes({
+      routes: ['demo'],
+      shadow: { demo: { ghost: { image: true } } },
+      providers: { demo: { models: [{ id: 'm1' }] } },
+      settings: fakeSettings,
+    })
+    if (outcome.ok !== true || outcome.changedRoutes.length !== 0) throw new Error(`default reconcile must not resurrect: ${JSON.stringify(outcome)}`)
+    if (mutateCalls.some(call => call.ns === 'llm-pi-ai')) throw new Error('deleted entry resurrected via default allowCreate')
+    ok('reconcile: 缺省（不传 allowCreate）调和不得复活被删条目')
+  }
+  {
+    // 复活防护 D（复活 bug 回归·caps.set 创建范围）：影子段还记着已删除的
+    // ghost 时，显式勾选只允许创建目标条目，ghost 绝不被顺手重建。
+    mutateCalls.length = 0
+    const outcome = await entry.reconcileRoutes({
+      routes: ['demo'],
+      shadow: { demo: { fresh: { image: true }, ghost: { image: true } } },
+      providers: { demo: { models: [{ id: 'm1' }] } },
+      settings: fakeSettings,
+      allowCreate: true,
+      createIds: ['fresh'],
+    })
+    if (outcome.ok !== true || outcome.changedRoutes.length !== 1) throw new Error(`scoped create should write once: ${JSON.stringify(outcome)}`)
+    const written = mutateCalls.filter(call => call.ns === 'llm-pi-ai')[0]?.ops[0]?.value
+    if (!Array.isArray(written)) throw new Error('no models array written')
+    if (written.some(row => row.id === 'ghost')) throw new Error(`ghost resurrected via scoped create: ${JSON.stringify(written)}`)
+    const fresh = written.find(row => row.id === 'fresh')
+    if (fresh === undefined || JSON.stringify(fresh.input) !== JSON.stringify(['text', 'image'])) {
+      throw new Error(`target entry not created: ${JSON.stringify(written)}`)
+    }
+    ok('reconcile: createIds 限定创建范围（目标创建、ghost 不复活）')
+  }
+  {
     // 用户显式勾选新 id（caps.set 立即调和 allowCreate=true）→ 创建条目。
     mutateCalls.length = 0
     const res = makeRes()
@@ -341,6 +406,42 @@ try {
     ok('rpc: 显式勾选新模型 id → 创建条目并写入 input')
   }
   {
+    // 复活防护 E（复活 bug 回归·caps.set 全链路）：影子段还记着已删除的
+    // ghost 时，同路由显式勾选经 handleRpc + 生产 createIds 接线，只更新目标，
+    // ghost 不得被重建。
+    mutateCalls.length = 0
+    const scoped = makeStatefulSettings(
+      { providers: { demo: { models: [{ id: 'm1', input: ['text'] }] } } },
+      { providers: { demo: { ghost: { image: true } } } },
+    )
+    const svScoped = {
+      settings: scoped,
+      reconciler: {
+        reconcile: (routes, options) => entry.reconcileRoutes({
+          routes,
+          shadow: entry.readShadowProviders(scoped),
+          providers: entry.readUserProviders(scoped),
+          settings: scoped,
+          ...(options === undefined ? {} : {
+            allowCreate: options.allowCreate === true,
+            ...(options.createIds === undefined ? {} : { createIds: options.createIds }),
+          }),
+        }),
+      },
+    }
+    const res = makeRes()
+    await handleRpc(makeReq('POST', { 'content-type': 'application/json', 'x-dsh-model-toggles': '1' },
+      '{"method":"caps.set","route":"demo","model":"m1","patch":{"image":true}}'), res, svScoped)
+    const parsed = JSON.parse(res.body)
+    if (parsed.ok !== true) throw new Error(`caps.set with ghost shadow failed: ${res.body}`)
+    const written = mutateCalls.filter(call => call.ns === 'llm-pi-ai')[0]?.ops[0]?.value
+    if (!Array.isArray(written)) throw new Error('expected exactly one llm write')
+    if (written.some(row => row.id === 'ghost')) throw new Error(`ghost resurrected by caps.set reconcile: ${JSON.stringify(written)}`)
+    const m1 = written.find(row => row.id === 'm1')
+    if (JSON.stringify(m1?.input) !== JSON.stringify(['text', 'image'])) throw new Error(`target not updated: ${JSON.stringify(m1)}`)
+    ok('rpc: caps.set 调和只创建目标条目，影子段里的已删模型不复活')
+  }
+  {
     // 事件回路：settings/updated(llm-pi-ai) 触发调和（防抖后无差异不再写）。
     mutateCalls.length = 0
     settingsUpdatedListener.listener('llm-pi-ai')
@@ -349,6 +450,58 @@ try {
     const llmCalls = mutateCalls.filter(call => call.ns === 'llm-pi-ai')
     if (llmCalls.length !== 0) throw new Error(`reconcile on event should converge to no-op, got ${llmCalls.length}`)
     ok('rpc: settings/updated 事件触发调和且无差异收敛')
+  }
+  {
+    // 复活防护 F（复活 bug 回归·事件全链路）：官方编辑器保存删除模型后，
+    // settings/updated 触发的兜底调和走缺省 allowCreate —— 影子段里还记着的
+    // 已删模型（fresh、ghost）绝不会被写回 models 数组（旧实现正是在这里把
+    // 它们复活）；仍在列表里的 m1 受管字段完好时也不得有任何修复写。
+    // 同时：影子段里的已删键（fresh、ghost）必须被自动清理，无需人工。
+    mutateCalls.length = 0
+    fakeSettings.state.llm.providers.demo.models = [
+      { id: 'm1', input: ['text', 'image'], reasoningEfforts: { off: null, high: 'high', max: 'max' } },
+    ]
+    fakeSettings.state.shadow.providers.demo.ghost = { image: true }
+    settingsUpdatedListener.listener('llm-pi-ai')
+    await new Promise(resolve => setTimeout(resolve, 90))
+    const llmCalls = mutateCalls.filter(call => call.ns === 'llm-pi-ai')
+    if (llmCalls.length !== 0) throw new Error(`event reconcile resurrected ghost: ${JSON.stringify(llmCalls)}`)
+    const models = fakeSettings.state.llm.providers.demo.models
+    if (models.some(row => row.id === 'ghost' || row.id === 'fresh')) {
+      throw new Error(`deleted model present in state after event reconcile: ${JSON.stringify(models)}`)
+    }
+    const demoShadow = fakeSettings.state.shadow.providers.demo ?? {}
+    if (demoShadow.ghost !== undefined || demoShadow.fresh !== undefined) {
+      throw new Error(`deleted-model shadow keys not auto-pruned: ${JSON.stringify(fakeSettings.state.shadow)}`)
+    }
+    if (demoShadow.m1 === undefined) throw new Error('live model shadow key must stay')
+    ok('rpc: 官方保存事件调和缺省不复活被删模型，影子键自动清理（复活 bug 回归）')
+  }
+  {
+    // 影子自动清理（路由级）：路由被删后，整段影子键自动清理，无需人工。
+    mutateCalls.length = 0
+    delete fakeSettings.state.llm.providers.demo
+    settingsUpdatedListener.listener('llm-pi-ai')
+    await new Promise(resolve => setTimeout(resolve, 90))
+    if (mutateCalls.some(call => call.ns === 'llm-pi-ai')) throw new Error('deleted provider must not be rewritten')
+    if (fakeSettings.state.shadow.providers.demo !== undefined) {
+      throw new Error(`deleted route shadow section not pruned: ${JSON.stringify(fakeSettings.state.shadow)}`)
+    }
+    ok('rpc: 删除路由后影子段整段自动清理')
+  }
+  {
+    // 影子自动清理（目录 passthrough）：路由无显式 models 列表时无法判定删除，
+    // 影子键保留，且调和 + 清理全程不得写盘（不接管、不误清）。
+    mutateCalls.length = 0
+    fakeSettings.state.llm.providers.catalog = {}
+    fakeSettings.state.shadow.providers.catalog = { m1: { image: true } }
+    settingsUpdatedListener.listener('llm-pi-ai')
+    await new Promise(resolve => setTimeout(resolve, 90))
+    if (mutateCalls.length !== 0) throw new Error(`catalog passthrough must not write: ${JSON.stringify(mutateCalls)}`)
+    if (fakeSettings.state.shadow.providers.catalog?.m1 === undefined) {
+      throw new Error(`catalog shadow key wrongly pruned: ${JSON.stringify(fakeSettings.state.shadow)}`)
+    }
+    ok('rpc: 无 models 列表的路由影子键保留（不误清、零写盘）')
   }
   {
     // 回归（上下文窗口丢失）：currentUserEntriesOf 必须保留非受管字段。

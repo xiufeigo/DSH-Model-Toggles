@@ -2,7 +2,8 @@
  * dsh-model-toggles — Host 半边。
  *
  * 在共享 webServer 上注册一条 JSON RPC 路由（POST /dsh-model-toggles/rpc），
- * 浏览器半边把它挂在官方「模型」页的每个模型条目里（图片输入 + 思考强度勾选）。
+ * 浏览器半边把它挂在官方「模型」页的每个模型条目里（图片输入 + 思考强度勾选，
+ * 档位对齐 pi-ai：最低/低/中/高/超高/最高）。
  *
  * 架构：勾选状态的事实源放在本插件自己的 settings 段（`model-toggles:`），
  * host 监听 `llm-pi-ai` 段变更并把勾选【调和（reconcile）】进
@@ -27,6 +28,7 @@ import {
 	isEmptyOverride,
 	isThinkingLevel,
 	mergeCapabilityEntries,
+	pruneShadowProviders,
 	THINKING_LEVELS,
 	type CapabilityOverride,
 	type ModelEntry,
@@ -233,9 +235,11 @@ export interface ReconcileOutcome {
 /**
  * 把影子勾选调和进 llm-pi-ai 的 models 数组。只处理影子里有条目的路由；
  * 无差异不写（收敛保证，防事件循环）。
- * @param input.allowCreate 是否允许创建缺失条目/接管目录。仅用户显式勾选
- *   （caps.set 的立即调和）为 true；事件驱动的兜底调和为 false —— 用户删除的
- *   路由/条目不得被复活。
+ * @param input.allowCreate 是否允许创建缺失条目/接管目录。**缺省 false**（引擎级
+ *   安全默认：调用方漏传也绝不复活）；仅用户显式勾选（caps.set 的立即调和）显式
+ *   传 true。事件驱动的兜底调和不得复活用户删除的路由/条目。
+ * @param input.createIds allowCreate=true 时仅允许创建这些 id 的缺失条目
+ *   （caps.set 传本次勾选的目标）；缺省 = 全部缺失条目（接管语义）。
  */
 export async function reconcileRoutes(input: {
 	routes: string[]
@@ -243,11 +247,12 @@ export async function reconcileRoutes(input: {
 	providers: Record<string, unknown>
 	settings: SettingsServiceLike
 	allowCreate?: boolean
+	createIds?: readonly string[]
 }): Promise<ReconcileOutcome> {
 	const ops: Array<{ op: 'set', path: string[], value: ModelEntry[] }> = []
 	const changedRoutes: string[] = []
 	for (const route of input.routes) {
-		if (!(route in input.providers)) continue // 用户已删除该路由：影子留着，绝不复活。
+		if (!(route in input.providers)) continue // 用户已删除该路由：绝不复活（影子段由清理流程自动移除）。
 		const overrides = input.shadow[route]
 		if (overrides === undefined || Object.keys(overrides).length === 0) continue
 		const currentEntries = currentUserEntriesOf(input.providers, route)
@@ -257,7 +262,9 @@ export async function reconcileRoutes(input: {
 				currentEntries,
 				takeoverBase: installedEntriesOf(route),
 				overrides,
-				allowCreate: input.allowCreate,
+				// 安全默认：undefined 一律按 false 处理（事件调和漏传不得复活删除）。
+				allowCreate: input.allowCreate === true,
+				...(input.createIds === undefined ? {} : { createIds: input.createIds }),
 			})
 		} catch (error) {
 			return { ok: false, changedRoutes, error: `${route}: ${errorMessage(error)}` }
@@ -279,7 +286,7 @@ export async function reconcileRoutes(input: {
 // ── RPC 分发 ────────────────────────────────────────────────────────────────
 
 export interface Reconciler {
-	reconcile(routes: string[], options?: { allowCreate?: boolean }): Promise<ReconcileOutcome>
+	reconcile(routes: string[], options?: { allowCreate?: boolean, createIds?: readonly string[] }): Promise<ReconcileOutcome>
 }
 
 interface RpcServices {
@@ -371,8 +378,9 @@ export async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: R
 				return
 			}
 			// 立即调和（不等事件去抖），让响应携带落盘后的有效状态。
-			// 用户显式勾选：允许创建缺失条目/接管目录。
-			const outcome = await sv.reconciler.reconcile([route], { allowCreate: true })
+			// 用户显式勾选：允许创建缺失条目/接管目录，但只限本次勾选的目标 id ——
+			// 影子段里其他已被用户删除的模型不得被顺手复活。
+			const outcome = await sv.reconciler.reconcile([route], { allowCreate: true, createIds: [model] })
 			if (!outcome.ok) {
 				sendJson(res, 200, { ok: false, error: `写入 models 失败：${outcome.error ?? '未知错误'}` })
 				return
@@ -415,17 +423,40 @@ export function apply(ctx: HostContext): void {
 	let settings: SettingsServiceLike | undefined
 	let debounce: ReturnType<typeof setTimeout> | undefined
 
-	const reconcileNow = async (routes?: string[], options?: { allowCreate?: boolean }): Promise<ReconcileOutcome> => {
+	const reconcileNow = async (routes?: string[], options?: { allowCreate?: boolean, createIds?: readonly string[] }): Promise<ReconcileOutcome> => {
 		if (settings === undefined) return { ok: false, changedRoutes: [], error: 'settings 未挂载' }
 		const shadow = readShadowProviders(settings)
 		const targets = routes ?? Object.keys(shadow)
-		return reconcileRoutes({
+		const outcome = await reconcileRoutes({
 			routes: targets,
 			shadow,
 			providers: readUserProviders(settings),
 			settings,
-			...options === undefined ? {} : { allowCreate: options.allowCreate },
+			// 不传 options（事件驱动的兜底调和）= allowCreate false：绝不复活/接管。
+			allowCreate: options?.allowCreate === true,
+			...(options?.createIds === undefined ? {} : { createIds: options.createIds }),
 		})
+		// 调和成功后顺手自动清理影子段：官方编辑器删除的模型/路由，影子键跟随
+		// 清掉，无需人工维护。调和失败时保守跳过（等下一轮事件重试）；清理
+		// 失败只记警告，不影响勾选结果。只清已删键，收敛不循环。
+		if (outcome.ok) {
+			try {
+				const plan = pruneShadowProviders({
+					shadow: readShadowProviders(settings),
+					providers: readUserProviders(settings),
+				})
+				const ops: Array<{ op: 'unset', path: string[] }> = [
+					...plan.unsetModels
+						.filter(row => !plan.unsetRoutes.includes(row.route))
+						.map(row => ({ op: 'unset' as const, path: ['providers', row.route, row.model] })),
+					...plan.unsetRoutes.map(route => ({ op: 'unset' as const, path: ['providers', route] })),
+				]
+				if (ops.length > 0) await settings.mutate(OWN_NS, ops)
+			} catch (error) {
+				ctx.logger?.warn?.('%s: 影子段清理失败：%s', NAME, errorMessage(error))
+			}
+		}
+		return outcome
 	}
 
 	ctx.inject(['settings'], (sctx: { settings?: SettingsServiceLike, on?: (event: string, listener: (...args: unknown[]) => void) => unknown }) => {
@@ -451,6 +482,11 @@ export function apply(ctx: HostContext): void {
 		} catch (error) {
 			ctx.logger?.warn?.('%s: settings 事件监听不可用（勾选仍可用，但官方保存覆盖后不会自动补回）：%s', NAME, errorMessage(error))
 		}
+		// 启动即调和 + 清理一次：修复历史覆盖，并自动清掉已删模型/路由的影子
+		// 残留（含旧版本留下的无效键），无需人工清理。
+		void reconcileNow().catch((error: unknown) => {
+			ctx.logger?.warn?.('%s: 启动调和失败：%s', NAME, errorMessage(error))
+		})
 	})
 
 	ctx.effect(() => webServer.register({

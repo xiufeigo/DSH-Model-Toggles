@@ -10,10 +10,11 @@
  *    否则一旦声明任何档位，模型将无法关闭思考。
  */
 
-export const THINKING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export const THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number]
 
 export const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
+	minimal: '最低',
 	low: '低',
 	medium: '中',
 	high: '高',
@@ -60,6 +61,12 @@ function sameJson(a: unknown, b: unknown): boolean {
 	return JSON.stringify(a) === JSON.stringify(b)
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === 'object' && value !== null && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: undefined
+}
+
 /** 从一条 models 条目读有效能力；字段缺省按「未开启」处理。 */
 export function effectiveOf(entry: ModelEntry | undefined): EffectiveCapability {
 	const image = Array.isArray(entry?.input) && entry.input.includes('image')
@@ -89,6 +96,9 @@ export function isEmptyOverride(override: CapabilityOverride | undefined): boole
  * @param input.allowCreate 是否允许创建缺失的条目（含接管）。
  *   用户显式勾选（caps.set 的立即调和）= true；事件驱动的兜底调和 = false：
  *   后者绝不复活被官方编辑器删除的条目/路由，只修改仍在列表里的条目。
+ * @param input.createIds 仅当 allowCreate=true 时生效：只允许创建这些 id 的缺失
+ *   条目（caps.set 传本次勾选的目标，防止影子段里其他已删除模型被顺手复活）；
+ *   缺省 = 创建全部缺失条目（保留接管语义）。
  * @returns 合并后的完整数组、是否有变化、是否发生接管；skipped 表示因
  *   allowCreate=false 而整体跳过（无需写盘）。
  */
@@ -97,6 +107,7 @@ export function mergeCapabilityEntries(input: {
 	takeoverBase: ModelEntry[]
 	overrides: Record<string, CapabilityOverride>
 	allowCreate?: boolean
+	createIds?: readonly string[]
 }): { entries: ModelEntry[]; changed: boolean; createdTakeover: boolean; skipped: boolean } {
 	const { overrides } = input
 	const allowCreate = input.allowCreate !== false
@@ -134,6 +145,7 @@ export function mergeCapabilityEntries(input: {
 		let entry = byId.get(modelId)
 		if (entry === undefined) {
 			if (!allowCreate) continue // 条目已被用户删除：事件调和不得复活。
+			if (input.createIds !== undefined && !input.createIds.includes(modelId)) continue
 			entry = { id: modelId }
 			entries.push(entry)
 			byId.set(modelId, entry)
@@ -171,4 +183,58 @@ export function assertValidEntries(entries: ModelEntry[]): void {
 		if (seen.has(entry.id)) throw new Error(`模型 id 重复：${entry.id}`)
 		seen.add(entry.id)
 	}
+}
+
+/** 影子段清理计划：需要 unset 的路由段与模型键，以及清理后的完整影子树。 */
+export interface ShadowPrunePlan {
+	next: Record<string, Record<string, CapabilityOverride>>
+	unsetRoutes: string[]
+	unsetModels: Array<{ route: string, model: string }>
+}
+
+/**
+ * 影子段自动清理（纯逻辑）：删掉「事实已不存在」的影子键，让影子段与
+ * llm-pi-ai 用户配置保持一致 —— 用户在官方编辑器里删除模型/路由后无需人工
+ * 清理影子段。
+ *  - 路由不在 providers 里（已删除）→ 整段清理；
+ *  - 路由有显式 models 列表 → 清掉不在列表里的模型键（含空覆盖）；
+ *  - 路由无 models 列表（跟随内置目录）→ 无法凭列表判定删除，保留非空键；
+ *  - 清理后变空的路段连路由键一起移除，不留 `route: {}` 尾巴。
+ */
+export function pruneShadowProviders(input: {
+	shadow: Record<string, Record<string, CapabilityOverride>>
+	providers: Record<string, unknown>
+}): ShadowPrunePlan {
+	const next: Record<string, Record<string, CapabilityOverride>> = {}
+	const unsetRoutes: string[] = []
+	const unsetModels: Array<{ route: string, model: string }> = []
+	for (const [route, overrides] of Object.entries(input.shadow)) {
+		const profile = asRecord(input.providers[route])
+		if (profile === undefined) {
+			unsetRoutes.push(route) // 路由已被用户删除：整段清理。
+			continue
+		}
+		const models = Array.isArray(profile.models) ? profile.models : undefined
+		const kept: Record<string, CapabilityOverride> = {}
+		if (models === undefined) {
+			// 跟随内置目录：没有显式列表可对照，保留非空覆盖，仅清空覆盖。
+			for (const [model, override] of Object.entries(overrides)) {
+				if (isEmptyOverride(override)) unsetModels.push({ route, model })
+				else kept[model] = override
+			}
+		} else {
+			const liveIds = new Set<string>()
+			for (const raw of models) {
+				const record = asRecord(raw)
+				if (typeof record?.id === 'string' && record.id.length > 0) liveIds.add(record.id)
+			}
+			for (const [model, override] of Object.entries(overrides)) {
+				if (!liveIds.has(model) || isEmptyOverride(override)) unsetModels.push({ route, model })
+				else kept[model] = override
+			}
+		}
+		if (Object.keys(kept).length > 0) next[route] = kept
+		else unsetRoutes.push(route) // 段空了（或本来就是空段）：连路由键一起移除。
+	}
+	return { next, unsetRoutes, unsetModels }
 }
