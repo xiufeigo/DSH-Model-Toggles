@@ -127,12 +127,12 @@ try {
   const imageBox = container.querySelector('input[data-dshmt-image]')
   if (imageBox === null || imageBox.checked !== true) throw new Error('image checkbox should be checked (caps.image=true)')
   const levelBoxes = [...container.querySelectorAll('input[data-dshmt-level]')]
-  if (levelBoxes.length !== 5) throw new Error(`expected 5 level boxes, got ${levelBoxes.length}`)
+  if (levelBoxes.length !== 6) throw new Error(`expected 6 level boxes, got ${levelBoxes.length}`)
   const levelStates = Object.fromEntries(levelBoxes.map(box => [box.dataset.dshmtLevel, box.checked]))
-  if (levelStates.low !== false || levelStates.medium !== false || levelStates.high !== true || levelStates.xhigh !== false || levelStates.max !== true) {
+  if (levelStates.minimal !== false || levelStates.low !== false || levelStates.medium !== false || levelStates.high !== true || levelStates.xhigh !== false || levelStates.max !== true) {
     throw new Error(`level states wrong: ${JSON.stringify(levelStates)}`)
   }
-  ok('DOM: 展开条目注入控件并正确回显（图片=✓，high/max=✓，其余空）')
+  ok('DOM: 展开条目注入控件并正确回显（图片=✓，high/max=✓，含 minimal 共 6 档，其余空）')
 
   // 2. 勾选上报：图片取消 → {image:false}；勾低 → efforts 含 low。
   // （合成 change 事件不翻转 checked —— 先手动设置状态再派发，模拟真实点击效果。）
