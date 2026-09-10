@@ -5,11 +5,13 @@
  * 时序：
  *   1. caps.get 返回 qwen3.6-plus / qwen3.7-plus 两条完整状态；
  *   2. settings/document-updated 使缓存失效，服务端修改第一条能力；
- *   3. 用户勾第一条图片输入，caps.set 期间再次广播 document-updated；
- *   4. 最终必须两条都按服务端完整 map 回显。
+ *   3. 用户勾第一条图片输入（此时官方编辑卡片还开着 → 只暂存、零写盘）；
+ *   4. 关闭官方卡片 → 客户端提交暂存（caps.set），期间再次广播 document-updated；
+ *   5. 重新打开卡片后必须两条都按服务端完整 map 回显。
  *
- * 旧实现会在第 3 步用 caps.set 的单模型 response 重建 route map，第二条随即
- * 显示未勾选；本测试因此直接覆盖该回归。
+ * 旧实现会在第 3 步立刻写盘（让官方卡片的下一次保存必然 settings/conflict），
+ * 并在第 4 步用 caps.set 的单模型 response 重建 route map，第二条随即显示
+ * 未勾选；本测试同时覆盖这两条回归。
  */
 
 import { createRequire } from 'node:module'
@@ -157,11 +159,35 @@ try {
   }
   ok('client state: document-updated 失效后完整回读，不复用陈旧 in-flight promise')
 
-  // 用户重新勾第一条图片输入；caps.set 同时广播事件。最终第二条绝不能被清空。
+  // 用户重新勾第一条图片输入：官方编辑卡片仍开着 → 只暂存、零写盘（写盘会让
+  // 官方卡片的「保存」因冻结的 revision 必然 settings/conflict）。
   const firstImage = imageOf(entries[0])
   firstImage.checked = true
   firstImage.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
   await sleep(280)
+  const writesWhileCardOpen = rpcCalls.filter(call => call.endpoint === 'modelToggles/capsSet')
+  if (writesWhileCardOpen.length !== 0) {
+    throw new Error(`card open must stage instead of write: ${JSON.stringify(writesWhileCardOpen)}`)
+  }
+  if (imageOf(entries[0])?.checked !== true) throw new Error('staged checkbox reverted before the card closed')
+  if (controlsOf(entries[0])?.dataset.dshmtStaged !== '1') throw new Error('staged marker missing on controls')
+  ok('client state: 官方卡片打开期间勾选只暂存（零 caps.set），控件不回退')
+
+  // 关闭官方卡片（保存/取消/离开页面都会让它从 DOM 消失）→ 提交暂存。
+  const card = dom.window.document.querySelector('li[class*="rowCard"]')
+  const parent = card.parentElement
+  const anchor = card.nextSibling
+  card.remove()
+  await sleep(320)
+  const written = rpcCalls.filter(call => call.endpoint === 'modelToggles/capsSet')
+  if (written.length !== 1 || written[0].args.model !== 'qwen3.6-plus' || written[0].args.patch.image !== true) {
+    throw new Error(`closing the card must flush the staged toggle: ${JSON.stringify(written)}`)
+  }
+  ok('client state: 卡片关闭后提交暂存（caps.set 一次、载荷正确）')
+
+  // 重新打开卡片：caps.set 之后必须回读完整 route map —— 第二条绝不能失效。
+  parent.insertBefore(card, anchor)
+  await sleep(320)
   first = stateOf(entries[0])
   second = stateOf(entries[1])
   if (first.image !== true || second.image !== true || !second.efforts.high || !second.efforts.xhigh) {

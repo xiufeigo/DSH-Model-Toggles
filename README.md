@@ -23,14 +23,25 @@ composer / `/model` 弹窗提供的是**为下一个请求挑档位**（只能�
 且不写回 settings）；本插件补的是**声明这个模型有哪些能力**并持久化到
 `settings.yaml`。二者互补。
 
-本插件把勾选动作自动化：**勾一下立即写盘**（settings 原子写 + schema 校验 +
-热重载），无需点官方「保存」，模型选择器里该模型的图文能力与思考档位即时生效。
+本插件把勾选动作自动化：**勾一下立即回显，写盘在官方编辑卡片关闭/保存之后完成**
+——不必点官方「保存」也不必等它；卡片一关（保存成功、取消、离开设置页都算），
+勾选即写入 `settings.yaml`（settings 原子写 + schema 校验 + 热重载），模型选择器里
+该模型的图文能力与思考档位随即生效。
+
+**为什么不是「勾一下立刻写盘」**：官方编辑卡片把**打开那一刻**的 settings
+revision 冻结在 React state 里（`dsh-client-ui-settings-models` 的
+`expectedRevision`；自定义提供方创建卡是 `openedAt`），此后任何转发事件都不会
+重新取值，草稿也只存在于卡片内部。因此卡片打开期间插件若写入 `llm-pi-ai`，
+用户随后点「保存」必然以 `settings/conflict` 失败，提示
+「这张卡片打开期间，这些设置已被其他地方改动。请关闭后重新打开，在当前值上编辑。」
+——这正是本插件旧实现的两个报障之一。改为「卡片打开期间只暂存、关闭后才提交」
+后，插件的写入与官方卡片的写入不再抢同一个 revision。
 
 ## 版本号
 
 版本号跟随所对齐的 DSH 官方版本，并追加一个小版本号：官方 `0.1.5-rc.1`
 → 本插件 `0.1.5-rc.1.1`（同一官方版本上的后续修订依次为 `.2`、`.3`…）。
-当前对齐 **DSH 0.1.5-rc.1**。
+当前 **0.1.5-rc.1.2**（对齐 DSH 0.1.5-rc.1；`.2` 为「暂存写盘」修复）。
 
 ## 接入规范（DSH 官方插件规范，0.1.2-rc.1 起逐条核对）
 
@@ -58,12 +69,21 @@ composer / `/model` 弹窗提供的是**为下一个请求挑档位**（只能�
 ## 工作原理
 
 ```
-勾选 ──▶ capsSet（Remote 端点）──▶ ① 写影子段（settings.yaml 的 model-toggles:）
-                      ② 立即调和 ──▶ 写 llm-pi-ai.providers.<route>.models（原子）
+勾选 ──▶ 官方编辑卡片打开？ ──是──▶ 客户端暂存（控件立即回显 + 「待写入」提示）
+                            └─否──▶ capsSet（Remote 端点）
+                                       ① 写影子段（settings.yaml 的 model-toggles:）
+                                       ② 立即调和 ──▶ 写 llm-pi-ai.providers.<route>.models（原子）
+卡片关闭/保存 ──▶ 客户端提交暂存（capsSet，同上）──▶ 写盘 + 调和
 官方编辑器保存 ──▶ settings 变更事件 ──▶ 兜底调和（几十 ms 内补回勾选字段）
                                     └─▶ 顺手清理影子段：已删模型/路由的影子键自动移除
 启动 ──▶ 调和 + 清理各一次（修复历史覆盖、清掉旧版本遗留的无效影子键）
 ```
+
+提交暂存的时机只有三个：**官方卡片由打开变为关闭**（DOM 观察器识别）、
+卡片打开期间收到 `settings/document-updated`（官方保存已落盘，但卡片还开着 →
+仍不写）、以及（理论上控件只在卡片内，故几乎不会发生）没有卡片时直接勾选。
+暂存意图最多保留 5 分钟：新增模型/新增提供方这类**尚未保存的草稿**在官方保存
+落盘后会自动补写；用户放弃草稿则超时丢弃。
 
 勾选状态的**事实源**是插件自己的 settings 段（`model-toggles.providers.<route>.<model>`），
 不是官方编辑器的草稿。官方编辑器以「打开时的基线」做最小 path ops 保存，可能
@@ -106,10 +126,14 @@ pnpm plugin:install
 
 1. 设置 → 模型 → 点某提供方的「编辑」；
 2. 展开模型条目（高级箭头，`Capacities`）；
-3. 勾选「图片输入」与思考强度档位——立即写入
+3. 勾选「图片输入」与思考强度档位——控件立即回显并显示「待写入：保存或关闭本卡片后生效」；
+4. 关闭/保存该卡片（「保存」成功会关闭卡片；取消或离开设置页同样算）→ 勾选写入
    `~/.dsh/settings.yaml` 的
    `llm-pi-ai.providers.<route>.models[n].{input, reasoningEfforts}`（经影子段调和）；
-4. 官方编辑器的「保存」可照常使用，勾选不会被它冲掉。
+5. 官方编辑器的「保存」可照常使用，勾选不会被它冲掉，也不会再出现
+   「这张卡片打开期间，这些设置已被其他地方改动」的冲突提示；
+6. 新增（还没保存的）模型行同样可以勾选：先按官方流程把模型保存进列表，插件会在
+   保存后自动补写，无需重勾（勾选不会「勾上后自动消失」）。
 
 写盘效果示例（settings.yaml）：
 
@@ -162,18 +186,26 @@ pnpm plugin:uninstall
   `null` 只允许出现在 `off` 上，且空 `reasoningEfforts` / 只有 `off` 会被拒绝
   —— 本插件的「全部取消 = 删字段」正好避开这两种非法形状。
 - 勾选目标 = 条目在**已保存**配置里的模型 id（服务端强制）：官方编辑器里临时
-  改名/新增的模型（未保存进 models 列表）勾选会被拒绝并提示先保存 —— 防止
-  插件写入裸条目、与官方保存的插入操作撞出重复 id（重复会让调和器的条目校验
-  永久报错）；保存后重新打开即可勾选。
+  改名/新增的模型（未保存进 models 列表）勾选会被服务端拒绝（`model-toggles/model-unsaved`）
+  —— 防止插件写入裸条目、与官方保存的插入操作撞出重复 id（重复会让调和器的条目
+  校验永久报错）。客户端对此**不报错、也不回弹**：意图留在暂存表里，等官方把模型
+  保存落盘后的 `document-updated` 自动补写（见下条）；实测这就是「新增模型界面
+  勾上后自动消失」的修复点。
+- **暂存提交（写盘时机）**：官方编辑卡片打开期间勾选只进客户端暂存表（控件立即
+  回显 + 「待写入」提示），卡片一关（保存成功/取消/离开设置页）或收到
+  `document-updated` 时才提交 —— 因为卡片冻结了打开时的 settings revision，
+  卡片打开期间写 `llm-pi-ai` 会让它的「保存」必然 `settings/conflict`。暂存意图
+  保留 5 分钟后丢弃（用户放弃了官方草稿）；服务端真实拒绝（如写盘失败）则立即
+  丢弃并回读服务端真相反弹控件，不留假勾选。
 - 未写 `models:` 列表的路由（直接使用内置目录）：第一次显式勾选会以「内置目录
   全量 passthrough（保留 name / 容量字段）+ 勾选条目」接管为显式列表；接管后
   内置目录日后的更新不会自动出现（需手工同步或删除 models 列表恢复）。目录
   装载为懒加载（ensureCatalog，调和前必等待），但**只认「路由键 = pi-ai 内置
   provider 名」的路由**；自定义路由键目录不可知 → 拒绝接管并提示先添加模型。
   capsGet 对目录路由回退内置目录，能力显示不为空。
-- 快速连续勾选同一模型的两个维度时，客户端按 (route, model) 串行提交，不会
-  互相覆盖；RPC 带 15s 超时，挂起请求不会卡死串行队列。写入失败时客户端强制
-  回读服务端真相，勾选框自动复位（不停留在用户点击后的假状态）。
+- 同一次暂存提交按 (route, model) 串行（一次一个键），同一模型连续勾两个维度会
+  合并成一次载荷，不会互相覆盖；重试型失败带 1.5s 退避，避免 DOM 变更风暴打
+  RPC，收到 `document-updated` 立即清退避重试；RPC 带 15s 超时。
 
 ## 结构
 
@@ -186,13 +218,17 @@ src/capabilities.ts   纯逻辑：efforts 形状 / 有效状态 / 合并（接�
 src/index.ts          Host：TypertRemoteService（service key = wire namespace
                       `modelToggles`）+ 三个 @Remote 端点（metaRoutes / capsGet /
                       capsSet）+ 影子段 + 调和引擎 + settings 事件接线
-src/client/inject.ts  DOM 注入层（aria-label/类名子串锚点，防御式、幂等）
-src/client/index.tsx  浏览器半边：按路由完整能力快照缓存 + token 失效保护 + MutationObserver
+src/client/inject.ts  DOM 注入层（aria-label/类名子串锚点，防御式、幂等）+
+                      `editorCardOpen()`「官方卡片是否打开」判定 + 「待写入」提示
+src/client/index.tsx  浏览器半边：按路由完整能力快照缓存 + token 失效保护 +
+                      MutationObserver + 暂存表（卡片打开期间不写盘，关闭后提交）
 src/client/rpc.ts     ctx.connection.rpc.call('/api', 'modelToggles/<method>', { args }) 薄封装
 scripts/smoke.mjs     冒烟：两个 bundle 真实求值 + 逻辑单测 + 真 cordis Context 上实例化
                       Service 断言 @Remote 标记 + 端点业务/收敛/复活防护直测
 scripts/dom-test.mjs  jsdom 集成：按官方编辑器真实 DOM 形状直测注入与上报
 scripts/client-state-test.mjs 两模型同路由状态回归：事件失效 + capsSet 不得截断缓存
+scripts/client-staging-test.mjs 暂存回归：卡片打开零写盘 / 草稿模型勾选不回弹 /
+                      官方保存后自动补写 / 真实失败回显真相
 scripts/verify-live.mjs 重启后一键活实例验证（只读）
 scripts/check-shadow.mjs 影子段核对：解析 settings.yaml，报告指向不存在路由/模型的
                       无效键（目录 passthrough 路由跳过模型级核对）
@@ -212,7 +248,10 @@ pnpm verify            # 冒烟 33 项（真 cordis Context 上断言 @Remote �
                       收敛/复活防护/影子自动清理/目录接管/事件接线）
 pnpm test:dom          # jsdom DOM 集成 7 项
 pnpm test:client-state # 两模型同路由缓存回归（防止「勾一个另一个失效」）
-pnpm test              # typecheck + verify + test:dom + test:client-state 四连
+pnpm test:client-staging # 暂存回归 7 项（卡片打开零写盘 / 草稿模型不回弹 /
+                       # 官方保存后自动补写 / 真实失败回显真相）
+pnpm test              # typecheck + verify + test:dom + test:client-state
+                       # + test:client-staging 五连
 pnpm verify:live       # 活实例只读验证（需 DSH 已重启加载本插件）
                        # 探测 `/api/modelToggles/metaRoutes`；脚本无会话 cookie 时得
                        # 401 = 端点已挂载且鉴权生效（这是期望）；传 `?token=` 的 URL
@@ -225,9 +264,14 @@ pnpm verify:live       # 活实例只读验证（需 DSH 已重启加载本插�
 里已删除的模型按裸条目复活的接线 bug）、`ensureCatalog` 从未被调用导致目录接管
 在生产恒失败的死接线、影子段自身变更事件触发清理会误删「刚写入、尚未调和成功」
 的键、显示名撞名时勾选写错路由、未保存模型勾选可产生重复 id 条目，同一路由
-单模型 `capsSet` 响应截断完整能力缓存、导致「勾一个另一个失效」的竞态，以及
+单模型 `capsSet` 响应截断完整能力缓存、导致「勾一个另一个失效」的竞态，
 调和器读条目时剥掉非受管字段、整写 models 数组把用户在官方编辑器保存的
-contextWindow / maxTokens 一并抹掉的「上下文窗口丢失」。
+contextWindow / maxTokens 一并抹掉的「上下文窗口丢失」，以及本轮修掉的两个：
+**卡片打开期间写盘导致官方「保存」必然 `settings/conflict`**（用户可见提示
+「这张卡片打开期间，这些设置已被其他地方改动…」）与**新增（未保存）模型行勾选
+后自动回弹**（服务端 `model-unsaved` 被客户端当成失败立刻回读复位）——
+修复方式是客户端暂存 + 卡片关闭/官方保存后提交，回归测试
+`scripts/client-staging-test.mjs` 直接断言「卡片打开期间 capsSet 调用次数为 0」。
 
 规范要点：host 半边是 TypertRemoteService（@Remote 端点由 Gateway 认领，无自建路由；Service 随 fiber 释放）、
 settings 走 `ctx.inject(['settings'])` 可选依赖；`@deepseek-ai/*` 与
@@ -237,6 +281,14 @@ client 半边只 external react 家族、其余全内联、CJS 工厂经 `__Modu
 
 ## 已知取舍
 
+- **勾选不是「点一下立刻落盘」，而是「卡片关闭/保存后落盘」**：官方编辑卡片
+  把打开时的 settings revision 冻结在 React state 里且从不因转发事件重新取值
+  （`dsh-client-ui-settings-models` 的 `expectedRevision` / `openedAt`，草稿也
+  只在卡片内部），所以卡片打开期间插件一旦写 `llm-pi-ai`，官方下一次「保存」
+  必然失败（`settings/conflict`）。这是官方 CAS 语义下唯一无冲突的选择：控件
+  立即回显（写盘前是暂存态，带「待写入」提示），提交发生在卡片关闭之后。代价
+  是暂存意图只在浏览器内存里：卡片还开着时刷新/关闭标签页会丢（最多 5 分钟
+  后自动丢弃；新增模型草稿被拒时保留到官方保存或超时）。
 - 界面锚点依赖官方编辑器结构（CSS-module 类名子串 + aria-label）。上游大改
   DOM 时勾选可能不出现 —— 属非破坏性降级，更新锚点即可恢复。已在
   0.1.2-rc.1 → 0.1.5-rc.1 上逐锚点核对：`modelEntry` / `modelRow` /

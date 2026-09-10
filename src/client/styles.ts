@@ -10,6 +10,8 @@ const CSS = `
 .dshmt-group-label { opacity:.62; }
 .dshmt-group { display:inline-flex; align-items:center; gap:2px 10px; flex-wrap:wrap; }
 .dshmt-hint { opacity:.5; font-size:11px; }
+.dshmt-hint[hidden] { display:none; }
+[data-dshmt-controls][data-dshmt-staged="1"] { border-left:2px solid #f5a623; padding-left:6px; }
 `
 
 export function injectStyles(): () => void {

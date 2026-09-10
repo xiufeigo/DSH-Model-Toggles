@@ -12,6 +12,10 @@
  * 官方编辑器保存用「打开时基线」做最小 path ops，可能用过期数组覆盖我们的
  * 字段；因此勾选状态的事实源在 host 影子段，host 在 llm-pi-ai 变更后自动
  * 调和补回 —— 本层只负责渲染与上报，不信任官方草稿。
+ *
+ * 写盘时机由上层（src/client/index.tsx）决定：官方编辑卡片打开期间只暂存
+ * （卡片冻结了打开时的 settings revision，外部写入会让它的保存必然冲突），
+ * 因此这里额外渲染一个「待写入」提示（`editorCardOpen()` 判定卡片是否还在）。
  */
 
 import {
@@ -21,16 +25,38 @@ import {
 } from '../capabilities'
 
 export const CONTROLS_MARKER = 'dshmt-controls'
+/** 暂存态提示（官方卡片打开期间勾选只暂存，关闭卡片后才写盘）。 */
+const STAGED_HINT = '待写入：保存或关闭本卡片后生效'
 
 export interface ToggleHooks {
 	/** 目录映射：直接路由键集合 + 显示名→路由键。 */
 	getDirectory(): { direct: Set<string>, byName: Map<string, string> }
-	/** 某路由的有效能力缓存（undefined = 尚未拉取）。 */
+	/** 某路由的有效能力缓存（含暂存覆盖；undefined = 尚未拉取）。 */
 	getCaps(route: string): Map<string, EffectiveCapability> | undefined
+	/** 该 (route, model) 是否有尚未提交 host 的暂存勾选。 */
+	isStaged?(route: string, model: string): boolean
 	/** 需要为某路由拉取能力（异步完成后调用方应再扫一遍）。 */
 	requestCaps(route: string): void
 	/** 勾选变化上报 host。 */
 	onToggle(route: string, model: string, patch: { image?: boolean, efforts?: ThinkingLevel[] }): void
+}
+
+/**
+ * 是否有官方的 llm-pi-ai 编辑卡片正打开着。
+ *
+ * 判定 = DOM 里存在位于某个 `div[class*="editor"]` 内的 `div[class*="modelEntry"]`。
+ * 官方两类卡片（既有提供方的 `ProviderEditor` 与「添加自定义提供方」的
+ * `CustomProviderCard`，后者根节点同样是 `zGbnIq_editor`）都渲染模型条目，
+ * 且都把打开那一刻的 settings revision 冻结在自己的 React state 里 —— 卡片
+ * 打开期间对 `llm-pi-ai` 的任何外部写入都会让它的下一次保存变成
+ * `settings/conflict`。没有模型条目的卡片不可能有本插件控件，故无需单独判定。
+ */
+export function editorCardOpen(doc: Document): boolean {
+	if (typeof doc === 'undefined' || doc.body === null) return false
+	for (const entry of doc.body.querySelectorAll('div[class*="modelEntry"]')) {
+		if (entry.closest('div[class*="editor"]') !== null) return true
+	}
+	return false
 }
 
 function firstTextInput(parent: ParentNode, selector: string): HTMLInputElement | undefined {
@@ -44,7 +70,10 @@ function firstTextInput(parent: ParentNode, selector: string): HTMLInputElement 
 
 /** 从条目向上解析 (route, modelId)；解析失败返回 undefined（不注入）。 */
 function resolveTarget(entry: Element, hooks: ToggleHooks): { route: string, modelId: string } | undefined {
-	// 排除非编辑器上下文（如自定义提供方创建卡）。
+	// 只认官方编辑卡片里的条目。注意「添加自定义提供方」卡片（CustomProviderCard）
+	// 根节点同样是 zGbnIq_editor，真正把它排除在外的是路由解析：它既没有
+	// editorRoute 文本，editorTitle 也是本地化的标题（不在「显示名 → 路由键」
+	// 目录里），因此解析不到 route。
 	if (entry.closest('div[class*="editor"]') === null) return undefined
 	const row = entry.querySelector(':scope > div[class*="modelRow"]') ?? entry.querySelector('div[class*="modelRow"]')
 	const idInput = row === null ? undefined : firstTextInput(row, 'input[type="text"]')
@@ -77,14 +106,17 @@ function levelBoxes(container: HTMLElement): HTMLInputElement[] {
 	return boxes
 }
 
-/** 用有效能力更新既有控件的勾选状态（不发事件）。 */
-function updateStates(container: HTMLElement, caps: EffectiveCapability | undefined): void {
+/** 用有效能力更新既有控件的勾选状态（不发事件），并同步暂存提示。 */
+function updateStates(container: HTMLElement, caps: EffectiveCapability | undefined, staged: boolean): void {
 	const image = container.querySelector<HTMLInputElement>('input[data-dshmt-image]')
 	if (image !== null) image.checked = caps?.image === true
 	const checkedLevels = new Set(caps?.efforts ?? [])
 	for (const box of levelBoxes(container)) {
 		box.checked = checkedLevels.has(box.dataset.dshmtLevel as ThinkingLevel)
 	}
+	container.dataset.dshmtStaged = staged ? '1' : '0'
+	const hint = container.querySelector<HTMLElement>('[data-dshmt-pending]')
+	if (hint !== null) hint.hidden = !staged
 }
 
 function checkedLevels(container: HTMLElement): ThinkingLevel[] {
@@ -110,8 +142,9 @@ function augmentEntry(entry: Element, route: string, modelId: string, hooks: Tog
 		container = null
 	}
 	const caps = hooks.getCaps(route)?.get(modelId)
+	const staged = hooks.isStaged?.(route, modelId) === true
 	if (container !== null) {
-		updateStates(container, caps)
+		updateStates(container, caps, staged)
 		return
 	}
 
@@ -154,7 +187,16 @@ function augmentEntry(entry: Element, route: string, modelId: string, hooks: Tog
 	}
 
 	container.append(imageLabel, group)
-	updateStates(container, caps)
+
+	// 暂存提示：官方卡片打开期间勾选不写盘（写了会让官方「保存」必然冲突）。
+	const hint = entry.ownerDocument.createElement('span')
+	hint.className = 'dshmt-hint'
+	hint.dataset.dshmtPending = '1'
+	hint.textContent = STAGED_HINT
+	hint.hidden = true
+	container.append(hint)
+
+	updateStates(container, caps, staged)
 	advanced.append(container)
 }
 
