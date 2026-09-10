@@ -1,0 +1,16 @@
+# dsh-model-toggles bundle layer.
+#
+# This file is the package's own profile patch layer: it is applied when the
+# profile lists this package under `dsh.profile.bundles`, which
+# `dsh plugin --profile <name> add <this-package>` reconciles automatically for
+# every installed dependency whose manifest declares `dsh.bundle`
+# (see @deepseek-ai/dsh/plugin and @deepseek-ai/dsh-app-boot).
+#
+# The browser half needs no row here: it is discovered from the `dsh.client`
+# declaration in package.json and served by @deepseek-ai/dsh-client-modules.
+
+- insert:
+    # Dual-face plugin: the Host half registers the model-capability RPC on the
+    # Connection API channel; the browser half is scanned from `dsh.client`.
+    - id: dsh-model-toggles
+      name: dsh-model-toggles

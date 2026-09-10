@@ -2,3 +2,5 @@ node_modules/
 lib/
 *.log
 *.tmp
+# 上游兼容性核对用的临时拉取目录（npm tarball 解包 + 报告），非源码。
+.probe/

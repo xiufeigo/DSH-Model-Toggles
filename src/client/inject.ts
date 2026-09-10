@@ -101,8 +101,11 @@ function augmentEntry(entry: Element, route: string, modelId: string, hooks: Tog
 	if (advanced === null) return // 未展开：折叠后 React 会移除高级区，展开时观察器会再次扫描
 
 	let container = advanced.querySelector<HTMLElement>(`:scope > div[data-${CONTROLS_MARKER}]`) as HTMLElement | null
+	// 陈旧检测：model 或 route 变了都要重建 —— 监听闭包捕获的是当时的 (route,
+	// modelId)，路由映射变化后旧监听会把勾选写去错误路由。
 	const staleModel = container?.dataset.dshmtModel ?? null
-	if (container !== null && staleModel !== null && staleModel !== modelId) {
+	const staleRoute = container?.dataset.dshmtRoute ?? null
+	if (container !== null && ((staleModel !== null && staleModel !== modelId) || (staleRoute !== null && staleRoute !== route))) {
 		container.remove()
 		container = null
 	}
@@ -116,6 +119,7 @@ function augmentEntry(entry: Element, route: string, modelId: string, hooks: Tog
 	// dataset 属性名必须驼峰（DOMStringMap 校验）：生成 data-dshmt-controls="1"。
 	container.dataset.dshmtControls = '1'
 	container.dataset.dshmtModel = modelId
+	container.dataset.dshmtRoute = route
 	container.className = CONTROLS_MARKER
 
 	// 图片输入

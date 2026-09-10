@@ -1,9 +1,11 @@
 /**
  * dsh-model-toggles — Host 半边。
  *
- * 在共享 webServer 上注册一条 JSON RPC 路由（POST /dsh-model-toggles/rpc），
- * 浏览器半边把它挂在官方「模型」页的每个模型条目里（图片输入 + 思考强度勾选，
- * 档位对齐 pi-ai：最低/低/中/高/超高/最高）。
+ * 在共享 Connection 服务上注册一条**逻辑 RPC channel**
+ * （`ctx.connection.rpc.handle('/dsh-model-toggles/rpc', handler)`，官方 feature
+ * 包同一接入方式），浏览器半边经 `ctx.connection.rpc.call(channel, endpoint,
+ * payload)` 调用。channel 路由由 Connection 统一挂在 webServer 上，并自动获得
+ * Host/Origin 信任闸门与浏览器会话鉴权 —— 插件不再自带跨站头/CORS 预检。
  *
  * 架构：勾选状态的事实源放在本插件自己的 settings 段（`model-toggles:`），
  * host 监听 `llm-pi-ai` 段变更并把勾选【调和（reconcile）】进
@@ -17,13 +19,13 @@
  *    off 恒可用（null = 支持 off、不发参数）；全部取消 → 删除字段。
  */
 
-import { IncomingMessage, ServerResponse } from 'node:http'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import {
 	assertValidEntries,
+	catalogEntriesOf,
 	effectiveOf,
 	isEmptyOverride,
 	isThinkingLevel,
@@ -36,13 +38,29 @@ import {
 } from './capabilities'
 
 const NAME = 'dsh-model-toggles'
-const RPC_PATH = `/${NAME}/rpc`
-const REQUEST_HEADER = 'x-dsh-model-toggles'
-const MAX_BODY_BYTES = 512 * 1024
+/** 本插件在 Connection 上的逻辑 RPC channel（绝对路径，插件自有前缀）。 */
+export const RPC_CHANNEL = `/${NAME}/rpc`
 const LLM_NS = 'llm-pi-ai'
 const OWN_NS = 'model-toggles'
 /** 官方保存/勾选风暴的调和去抖。 */
 const RECONCILE_DEBOUNCE_MS = 30
+
+/** 本插件 RPC 端点名（Connection 端点段必须匹配 `[A-Za-z0-9_$.-]+`）。 */
+export type RpcEndpoint = 'meta.routes' | 'caps.get' | 'caps.set'
+
+/** Connection 通用一元 RPC 结果（`@deepseek-ai/dsh-client-connection` 契约）。 */
+export type RpcResult<T> =
+	| { ok: true, value: T }
+	| { ok: false, error: { code: string, message: string, details: object } }
+
+function rpcOk<T>(value: T): RpcResult<T> {
+	return { ok: true, value }
+}
+
+/** 失败结果：code 稳定、可判定；message 面向用户。 */
+function rpcFail(code: string, message: string): RpcResult<never> {
+	return { ok: false, error: { code: `${NAME}/${code}`, message, details: {} } }
+}
 
 /** 本插件影子段：providers.<route>.<modelId> = { image?, efforts? }（字段缺省 = 不管理该维度）。 */
 const OwnSchema = z.object({
@@ -72,19 +90,13 @@ export function ensureCatalog(): Promise<void> {
 export function installedEntriesOf(route: string): ModelEntry[] {
 	if (getBuiltinModelsFn === undefined) return []
 	try {
-		const models = getBuiltinModelsFn(route) as Array<Record<string, unknown>>
-		const out: ModelEntry[] = []
-		for (const model of models) {
-			if (typeof model.id !== 'string' || model.id.length === 0) continue
-			out.push({ id: model.id })
-		}
-		return out
+		return catalogEntriesOf(getBuiltinModelsFn(route))
 	} catch {
 		return []
 	}
 }
 
-// ── settings 读取 / RPC 基础设施 ────────────────────────────────────────────
+// ── settings 读取 ──────────────────────────────────────────────────────────
 
 interface SettingsServiceLike {
 	describe(options?: { redactSecrets?: boolean }): Array<{ ns: string, user?: unknown }>
@@ -93,16 +105,20 @@ interface SettingsServiceLike {
 	mutate(ns: string, ops: Array<{ op: 'set' | 'unset', path: string[], value?: unknown }>, expectedRevision?: number): Promise<void>
 }
 
+/** Connection 通用 RPC channel 注册面（官方 feature 包同一接口）。 */
+interface ConnectionRpcHandler {
+	(endpoint: string, payload: unknown, signal: AbortSignal): Promise<RpcResult<unknown>>
+}
+interface ConnectionLike {
+	rpc: { handle(channel: string, handler: ConnectionRpcHandler): () => void | Promise<void> }
+}
+
 interface HostContext {
-	get(name: string): unknown
+	connection?: ConnectionLike
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	inject(deps: string[], callback: (ctx: any) => void): unknown
 	effect(callback: () => (() => void) | void, label?: string): () => void
 	logger?: { warn(...args: unknown[]): void, error(...args: unknown[]): void }
-}
-
-interface WebServerService {
-	register(route: { kind: 'exact' | 'prefix', path: string, handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }): () => void
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -113,60 +129,6 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error)
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-	res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-	res.end(JSON.stringify(body))
-}
-
-/** 跨站闸门：同源预检放行，POST 必须带插件自定义头。 */
-export function gateRequest(req: IncomingMessage, res: ServerResponse, methods = 'POST, OPTIONS'): boolean {
-	const origin = req.headers.origin
-	const host = req.headers.host
-	const sameHost = typeof origin === 'string' && origin.length > 0 && typeof host === 'string'
-		&& ((): boolean => {
-			try { return new URL(origin).host === host } catch { return false }
-		})()
-
-	if (req.method === 'OPTIONS') {
-		if (sameHost) {
-			res.writeHead(204, {
-				'access-control-allow-origin': origin,
-				'access-control-allow-methods': methods,
-				'access-control-allow-headers': `content-type, ${REQUEST_HEADER}`,
-				'access-control-max-age': '600',
-			})
-			res.end()
-		} else {
-			res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
-			res.end('forbidden origin')
-		}
-		return false
-	}
-	if (req.method !== 'POST' || req.headers[REQUEST_HEADER] !== '1') {
-		res.writeHead(req.method === 'POST' ? 403 : 405, { 'content-type': 'text/plain; charset=utf-8' })
-		res.end(req.method === 'POST' ? 'forbidden' : 'POST only')
-		return false
-	}
-	return true
-}
-
-async function readJsonBody(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<Record<string, unknown>> {
-	const chunks: Buffer[] = []
-	let total = 0
-	for await (const chunk of req) {
-		const piece = chunk as Buffer
-		total += piece.byteLength
-		if (total > limit) throw new Error(`请求体超过 ${limit} 字节`)
-		chunks.push(piece)
-	}
-	if (chunks.length === 0) return {}
-	const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-	if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-		throw new Error('请求体必须是 JSON 对象')
-	}
-	return parsed as Record<string, unknown>
 }
 
 /** 读 llm-pi-ai 用户段（raw user layer）。 */
@@ -240,6 +202,9 @@ export interface ReconcileOutcome {
  *   传 true。事件驱动的兜底调和不得复活用户删除的路由/条目。
  * @param input.createIds allowCreate=true 时仅允许创建这些 id 的缺失条目
  *   （caps.set 传本次勾选的目标）；缺省 = 全部缺失条目（接管语义）。
+ * @param input.getInstalled 内置目录视图（测试注入用）；缺省 installedEntriesOf。
+ *   注意：接管只对「路由键 = pi-ai 内置 provider 名」的路由有底表，自定义路由键
+ *   按空目录处理（安全拒绝接管）。
  */
 export async function reconcileRoutes(input: {
 	routes: string[]
@@ -248,6 +213,7 @@ export async function reconcileRoutes(input: {
 	settings: SettingsServiceLike
 	allowCreate?: boolean
 	createIds?: readonly string[]
+	getInstalled?: (route: string) => ModelEntry[]
 }): Promise<ReconcileOutcome> {
 	const ops: Array<{ op: 'set', path: string[], value: ModelEntry[] }> = []
 	const changedRoutes: string[] = []
@@ -260,7 +226,7 @@ export async function reconcileRoutes(input: {
 		try {
 			merged = mergeCapabilityEntries({
 				currentEntries,
-				takeoverBase: installedEntriesOf(route),
+				takeoverBase: (input.getInstalled ?? installedEntriesOf)(route),
 				overrides,
 				// 安全默认：undefined 一律按 false 处理（事件调和漏传不得复活删除）。
 				allowCreate: input.allowCreate === true,
@@ -283,30 +249,34 @@ export async function reconcileRoutes(input: {
 	}
 }
 
-// ── RPC 分发 ────────────────────────────────────────────────────────────────
+// ── RPC 分发（Connection channel handler） ──────────────────────────────────
 
 export interface Reconciler {
-	reconcile(routes: string[], options?: { allowCreate?: boolean, createIds?: readonly string[] }): Promise<ReconcileOutcome>
+	reconcile(routes: string[], options?: { allowCreate?: boolean, createIds?: readonly string[], prune?: boolean }): Promise<ReconcileOutcome>
 }
 
-interface RpcServices {
+export interface RpcServices {
 	settings: SettingsServiceLike | undefined
 	reconciler: Reconciler
+	/** 内置目录视图（测试注入用）；缺省 installedEntriesOf（真实 pi-ai 目录）。 */
+	getInstalled?: (route: string) => ModelEntry[]
 }
 
-/** RPC 入口（导出仅为 smoke 直测）。 */
-export async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: RpcServices): Promise<void> {
-	if (!gateRequest(req, res)) return
-	let body: Record<string, unknown>
+/**
+ * Connection channel handler：按端点分发，返回官方 `ConnectionRpcResult`。
+ * 传输层（HTTP 路由、Host/Origin 闸门、浏览器会话鉴权、rpcId 关联、信封校验）
+ * 全部由 `@deepseek-ai/dsh-client-connection` 拥有 —— 本函数只做业务分派。
+ * @param endpoint - channel 之后的端点名（由传输层校验并透传）。
+ * @param payload - 端点自有载荷（未知形状按缺省处理）。
+ * @param sv - 注入的服务（测试缝）。
+ * @param signal - 调用方取消信号。
+ * @returns 端点自有的成功/失败结果。
+ */
+export async function handleRpc(endpoint: string, payload: unknown, sv: RpcServices, signal?: AbortSignal): Promise<RpcResult<unknown>> {
+	if (signal?.aborted === true) return rpcFail('aborted', '请求已取消')
+	const body = asRecord(payload) ?? {}
 	try {
-		body = await readJsonBody(req)
-	} catch (error) {
-		sendJson(res, 400, { ok: false, error: `无效请求：${errorMessage(error)}` })
-		return
-	}
-	const method = typeof body.method === 'string' ? body.method : ''
-	try {
-		if (method === 'meta.routes') {
+		if (endpoint === 'meta.routes') {
 			const providers = readUserProviders(sv.settings)
 			const routes = Object.keys(providers).sort().map(route => {
 				const profile = asRecord(providers[route])
@@ -316,37 +286,43 @@ export async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: R
 					displayName: typeof displayName === 'string' && displayName.length > 0 ? displayName : route,
 				}
 			})
-			sendJson(res, 200, { ok: true, routes })
-			return
+			return rpcOk({ routes })
 		}
-		if (method === 'caps.get') {
+		if (endpoint === 'caps.get') {
 			const route = typeof body.route === 'string' ? body.route : ''
-			if (route.length === 0) {
-				sendJson(res, 200, { ok: false, error: '缺少 route' })
-				return
-			}
+			if (route.length === 0) return rpcFail('bad-request', '缺少 route')
+			// 目录 passthrough 路由（无显式 models 列表）回退内置目录，能力显示不为空。
+			await ensureCatalog()
 			const providers = readUserProviders(sv.settings)
-			const entries = currentUserEntriesOf(providers, route) ?? []
+			const entries = currentUserEntriesOf(providers, route) ?? (sv.getInstalled ?? installedEntriesOf)(route)
 			const models: Record<string, { image: boolean, efforts: ThinkingLevel[] }> = {}
 			for (const entry of entries) models[entry.id] = effectiveOf(entry)
-			sendJson(res, 200, { ok: true, models })
-			return
+			return rpcOk({ models })
 		}
-		if (method === 'caps.set') {
+		if (endpoint === 'caps.set') {
 			const route = typeof body.route === 'string' ? body.route : ''
 			const model = typeof body.model === 'string' ? body.model : ''
-			if (route.length === 0 || model.length === 0) {
-				sendJson(res, 200, { ok: false, error: '缺少 route 或 model' })
-				return
-			}
-			if (sv.settings === undefined) {
-				sendJson(res, 200, { ok: false, error: 'settings 服务未挂载，无法写入' })
-				return
-			}
+			if (route.length === 0 || model.length === 0) return rpcFail('bad-request', '缺少 route 或 model')
+			if (sv.settings === undefined) return rpcFail('unavailable', 'settings 服务未挂载，无法写入')
 			const providers = readUserProviders(sv.settings)
 			if (!(route in providers)) {
-				sendJson(res, 200, { ok: false, error: `路由 ${route} 不在 llm-pi-ai.providers 里；先在模型页添加并保存` })
-				return
+				return rpcFail('unknown-route', `路由 ${route} 不在 llm-pi-ai.providers 里；先在模型页添加并保存`)
+			}
+			// 只接受已保存条目：官方编辑器里的草稿/新增行（未保存）不得直接建裸条目 ——
+			// 否则与官方保存的插入 op 撞出重复 id，assertValidEntries 会让后续调和永久
+			// 失败。目录路由（无显式 models 列表）例外：那正是「首次勾选 → 接管」路径。
+			{
+				const profile = asRecord(providers[route])
+				if (Array.isArray(profile?.models)) {
+					const savedIds = new Set<string>()
+					for (const raw of profile.models) {
+						const record = asRecord(raw)
+						if (typeof record?.id === 'string' && record.id.length > 0) savedIds.add(record.id)
+					}
+					if (!savedIds.has(model)) {
+						return rpcFail('unsaved-model', `模型 ${model} 不在路由 ${route} 已保存的 models 列表；请先在官方编辑器保存该模型，再回来勾选`)
+					}
+				}
 			}
 			const patch = asRecord(body.patch) ?? {}
 			const override: CapabilityOverride = {}
@@ -355,10 +331,7 @@ export async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: R
 				const efforts = patch.efforts.filter((row): row is ThinkingLevel => isThinkingLevel(row))
 				override.efforts = [...new Set(efforts)]
 			}
-			if (isEmptyOverride(override)) {
-				sendJson(res, 200, { ok: false, error: '勾选载荷为空（image / efforts 至少给一个）' })
-				return
-			}
+			if (isEmptyOverride(override)) return rpcFail('bad-request', '勾选载荷为空（image / efforts 至少给一个）')
 			// 影子层合并：勾选即「受管」。false / 空数组是受管关闭（调和时删除字段），
 			// 不是解除管理 —— 这样官方保存覆盖后调和器才知道该字段应保持删除。
 			const shadow = readShadowProviders(sv.settings)
@@ -374,29 +347,29 @@ export async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: R
 			try {
 				await sv.settings.mutate(OWN_NS, ops)
 			} catch (error) {
-				sendJson(res, 200, { ok: false, error: `影子段写入失败：${errorMessage(error)}` })
-				return
+				return rpcFail('shadow-write-failed', `影子段写入失败：${errorMessage(error)}`)
 			}
 			// 立即调和（不等事件去抖），让响应携带落盘后的有效状态。
 			// 用户显式勾选：允许创建缺失条目/接管目录，但只限本次勾选的目标 id ——
 			// 影子段里其他已被用户删除的模型不得被顺手复活。
 			const outcome = await sv.reconciler.reconcile([route], { allowCreate: true, createIds: [model] })
-			if (!outcome.ok) {
-				sendJson(res, 200, { ok: false, error: `写入 models 失败：${outcome.error ?? '未知错误'}` })
-				return
-			}
+			if (!outcome.ok) return rpcFail('models-write-failed', `写入 models 失败：${outcome.error ?? '未知错误'}`)
 			const entries = currentUserEntriesOf(readUserProviders(sv.settings), route) ?? []
 			const effective = effectiveOf(entries.find(entry => entry.id === model))
-			sendJson(res, 200, { ok: true, effective })
-			return
+			return rpcOk({ effective })
 		}
-		sendJson(res, 200, { ok: false, error: `未知方法 ${method}` })
+		return rpcFail('unknown-endpoint', `未知端点 ${endpoint}`)
 	} catch (error) {
-		sendJson(res, 200, { ok: false, error: errorMessage(error) })
+		return rpcFail('internal', errorMessage(error))
 	}
 }
 
-// ── 插件对象 ────────────────────────────────────────────────────────────────
+// ── 插件对象（官方 feature 包同一形态：具名 name / inject / apply） ─────────
+
+export const name = NAME
+
+/** 硬 inject：等 Connection 就绪后再 apply（冷启动裸 apply 会静默丢 channel）。 */
+export const inject = ['connection']
 
 export function apply(ctx: HostContext): void {
 	/** 落盘诊断：apply 的每个阶段写一行 marker（排查装载问题用，量极小）。 */
@@ -412,19 +385,24 @@ export function apply(ctx: HostContext): void {
 		}
 	}
 	diag('apply-enter')
-	const webServer = ctx.get('webServer') as WebServerService | undefined
-	if (webServer === undefined) {
-		diag('no-webServer')
-		ctx.logger?.warn?.('%s: ctx.get("webServer") 返回 undefined（inject 未就绪？），RPC 路由未注册', NAME)
+	const connection = ctx.connection
+	if (connection === undefined || typeof connection.rpc?.handle !== 'function') {
+		diag('no-connection')
+		ctx.logger?.warn?.('%s: ctx.connection 不可用（inject 未就绪？），RPC channel 未注册', NAME)
 		return
 	}
-	diag('webServer-ok')
+	diag('connection-ok')
+	// 目录预热：懒加载 pi-ai 内置 provider 目录（失败按空目录降级，接管/回退
+	// 读侧仍可用，只是无底表）。
+	void ensureCatalog()
 
 	let settings: SettingsServiceLike | undefined
 	let debounce: ReturnType<typeof setTimeout> | undefined
 
-	const reconcileNow = async (routes?: string[], options?: { allowCreate?: boolean, createIds?: readonly string[] }): Promise<ReconcileOutcome> => {
+	const reconcileNow = async (routes?: string[], options?: { allowCreate?: boolean, createIds?: readonly string[], prune?: boolean }): Promise<ReconcileOutcome> => {
 		if (settings === undefined) return { ok: false, changedRoutes: [], error: 'settings 未挂载' }
+		// 目录装载（懒加载、缓存）：接管底表与 caps.get 回退都依赖它。
+		await ensureCatalog()
 		const shadow = readShadowProviders(settings)
 		const targets = routes ?? Object.keys(shadow)
 		const outcome = await reconcileRoutes({
@@ -437,9 +415,11 @@ export function apply(ctx: HostContext): void {
 			...(options?.createIds === undefined ? {} : { createIds: options.createIds }),
 		})
 		// 调和成功后顺手自动清理影子段：官方编辑器删除的模型/路由，影子键跟随
-		// 清掉，无需人工维护。调和失败时保守跳过（等下一轮事件重试）；清理
-		// 失败只记警告，不影响勾选结果。只清已删键，收敛不循环。
-		if (outcome.ok) {
+		// 清掉，无需人工维护。触发时机限定「官方保存（LLM_NS 事件）/ 启动 /
+		// caps.set 立即调和」—— 影子段自身变更（OWN_NS 事件）只调和不清理，
+		// 防止刚写入、尚未成功调和的键被当成「不在 models 列表」误删。
+		// 清理失败只记警告，不影响勾选结果；只清已删键，收敛不循环。
+		if (outcome.ok && options?.prune !== false) {
 			try {
 				const plan = pruneShadowProviders({
 					shadow: readShadowProviders(settings),
@@ -468,13 +448,15 @@ export function apply(ctx: HostContext): void {
 			ctx.logger?.warn?.('%s: settings.register(%s) 失败：%s', NAME, OWN_NS, errorMessage(error))
 		}
 		// 监听两段变更：官方保存覆盖 llm-pi-ai → 补回勾选字段；影子变更 → 应用勾选。
+		// 清理只在官方保存（LLM_NS）触发 —— 影子段自身变更不得清理自己（防误删
+		// 刚写入、尚未调和成功的键）。
 		try {
 			sctx.on?.('settings/updated', (ns: unknown) => {
 				if (ns !== LLM_NS && ns !== OWN_NS) return
 				if (debounce !== undefined) clearTimeout(debounce)
 				debounce = setTimeout(() => {
 					debounce = undefined
-					void reconcileNow().catch(error => {
+					void reconcileNow(undefined, { prune: ns === LLM_NS }).catch(error => {
 						ctx.logger?.warn?.('%s: 调和失败：%s', NAME, errorMessage(error))
 					})
 				}, RECONCILE_DEBOUNCE_MS)
@@ -489,24 +471,13 @@ export function apply(ctx: HostContext): void {
 		})
 	})
 
-	ctx.effect(() => webServer.register({
-		kind: 'exact',
-		path: RPC_PATH,
-		handler: (req, res) => void handleRpc(req, res, {
+	// Connection 拥有 channel 路由的 HTTP 挂载、Host/Origin 闸门与浏览器会话鉴权；
+	// 注册归属本 fiber（cordis service tracker 将 owner 绑定到读取者上下文），
+	// 插件卸载即随 fiber 释放。
+	ctx.effect(() => connection.rpc.handle(RPC_CHANNEL, (endpoint, payload, signal) =>
+		handleRpc(endpoint, payload, {
 			settings,
 			reconciler: { reconcile: (routes, options) => reconcileNow(routes, options) },
-		}).catch(error => {
-			if (!res.headersSent) sendJson(res, 500, { ok: false, error: errorMessage(error) })
-		}),
-	}), `${NAME}: rpc route`)
-	diag('route-registered', RPC_PATH)
-}
-
-/**
- * 插件对象带硬 inject：等 webServer 就绪后再 apply（裸 apply 冷启动会静默丢路由）。
- */
-export default {
-	name: NAME,
-	inject: ['webServer'],
-	apply,
+		}, signal)), `${NAME}: rpc channel`)
+	diag('channel-registered', RPC_CHANNEL)
 }

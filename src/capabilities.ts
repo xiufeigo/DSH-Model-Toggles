@@ -185,6 +185,37 @@ export function assertValidEntries(entries: ModelEntry[]): void {
 	}
 }
 
+/**
+ * 内置目录条目 → ModelEntry 的防御式转换（保留 name / input / reasoningEfforts /
+ * contextWindow / maxTokens / compat，未知形状按缺省处理）。接管底表用它保持
+ * 目录字段，避免接管写出只剩裸 id 的条目。
+ */
+export function catalogEntriesOf(models: unknown[]): ModelEntry[] {
+	const out: ModelEntry[] = []
+	for (const raw of models) {
+		const record = asRecord(raw)
+		if (record === undefined || typeof record.id !== 'string' || record.id.length === 0) continue
+		const entry: ModelEntry = { id: record.id }
+		if (typeof record.name === 'string' && record.name.length > 0) entry.name = record.name
+		if (Array.isArray(record.input)) entry.input = record.input.filter((row): row is string => typeof row === 'string')
+		const efforts = asRecord(record.reasoningEfforts)
+		if (efforts !== undefined) {
+			const map: Record<string, string | null> = {}
+			for (const [key, value] of Object.entries(efforts)) {
+				if (value === null) map[key] = null
+				else if (typeof value === 'string') map[key] = value
+			}
+			entry.reasoningEfforts = map
+		}
+		if (typeof record.contextWindow === 'number') entry.contextWindow = record.contextWindow
+		if (typeof record.maxTokens === 'number') entry.maxTokens = record.maxTokens
+		const compat = asRecord(record.compat)
+		if (compat !== undefined) entry.compat = { ...compat }
+		out.push(entry)
+	}
+	return out
+}
+
 /** 影子段清理计划：需要 unset 的路由段与模型键，以及清理后的完整影子树。 */
 export interface ShadowPrunePlan {
 	next: Record<string, Record<string, CapabilityOverride>>

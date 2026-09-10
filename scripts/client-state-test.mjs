@@ -58,7 +58,6 @@ try {
     window: globalThis.window,
     document: globalThis.document,
     MutationObserver: globalThis.MutationObserver,
-    fetch: globalThis.fetch,
   }
   globalThis.window = dom.window
   globalThis.document = dom.window.document
@@ -71,27 +70,32 @@ try {
   }
   let capsGetCalls = 0
   const rpcCalls = []
-  globalThis.fetch = async (_url, options) => {
-    const payload = JSON.parse(options.body)
-    rpcCalls.push(payload)
-    if (payload.method === 'meta.routes') {
-      return { ok: true, json: async () => ({ ok: true, routes: [{ provider: 'qwen-coding-plan', displayName: 'Qwen Coding Plan' }] }) }
-    }
-    if (payload.method === 'caps.get') {
-      capsGetCalls++
-      // 返回 detached data，模拟实际 JSON 边界。
-      return { ok: true, json: async () => ({ ok: true, models: structuredClone(capabilities) }) }
-    }
-    if (payload.method === 'caps.set') {
-      const { model, patch } = payload
-      capabilities = structuredClone(capabilities)
-      if ('image' in patch) capabilities[model].image = patch.image
-      if ('efforts' in patch) capabilities[model].efforts = patch.efforts
-      // 服务端一次写入同时会广播 settings/document-updated。
-      remoteListener?.()
-      return { ok: true, json: async () => ({ ok: true, effective: structuredClone(capabilities[model]) }) }
-    }
-    throw new Error(`unexpected RPC method ${payload.method}`)
+  /** 假 Connection：官方接入面 ctx.connection.rpc.call(channel, endpoint, payload)。 */
+  const connection = {
+    rpc: {
+      async call(channel, endpoint, payload) {
+        if (channel !== '/dsh-model-toggles/rpc') throw new Error(`unexpected RPC channel ${channel}`)
+        rpcCalls.push({ endpoint, payload })
+        if (endpoint === 'meta.routes') {
+          return { ok: true, value: { routes: [{ provider: 'qwen-coding-plan', displayName: 'Qwen Coding Plan' }] } }
+        }
+        if (endpoint === 'caps.get') {
+          capsGetCalls++
+          // 返回 detached data，模拟实际 JSON 边界。
+          return { ok: true, value: { models: structuredClone(capabilities) } }
+        }
+        if (endpoint === 'caps.set') {
+          const { model, patch } = payload
+          capabilities = structuredClone(capabilities)
+          if ('image' in patch) capabilities[model].image = patch.image
+          if ('efforts' in patch) capabilities[model].efforts = patch.efforts
+          // 服务端一次写入同时会广播 settings/document-updated。
+          remoteListener?.()
+          return { ok: true, value: { effective: structuredClone(capabilities[model]) } }
+        }
+        throw new Error(`unexpected RPC endpoint ${endpoint}`)
+      },
+    },
   }
 
   let captured = null
@@ -107,6 +111,7 @@ try {
   const plugin = captured.factory(injectedRequire)
   const disposers = []
   plugin.apply({
+    connection,
     remote: {
       $on(event, listener) {
         if (event !== 'settings/document-updated') throw new Error(`unexpected remote event ${event}`)
@@ -169,7 +174,6 @@ try {
   globalThis.window = original.window
   globalThis.document = original.document
   globalThis.MutationObserver = original.MutationObserver
-  globalThis.fetch = original.fetch
 } catch (error) {
   fail('client 状态回归', error)
 }

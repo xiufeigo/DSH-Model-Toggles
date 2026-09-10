@@ -5,11 +5,13 @@
  * 展开的模型条目注入「图片输入」+ 思考强度（最低/低/中/高/超高/最高）勾选。
  * 事实源在 host 影子段；本层维护目录映射与能力缓存，监听
  * settings/document-updated 后重新扫描（调和器把字段补回后勾选状态随之复位）。
+ *
+ * Host 调用走官方 Connection：`ctx.connection.rpc.call(channel, endpoint, payload)`。
  */
 
 import { type EffectiveCapability, type ThinkingLevel } from '../capabilities'
 import { removeInjectedControls, scanForEditorControls, type ToggleHooks } from './inject'
-import { rpc } from './rpc'
+import { rpc, type ClientConnectionLike } from './rpc'
 import { injectStyles } from './styles'
 
 interface RemoteLike {
@@ -17,33 +19,21 @@ interface RemoteLike {
 }
 
 interface ClientContext {
-	get(name: string): unknown
+	connection: ClientConnectionLike
 	effect(callback: () => (() => void) | void, label?: string): () => void
 	remote?: RemoteLike
 }
 
-interface MetaRoutesResponse extends RpcEnvelopeResponse {
-	routes?: Array<{ provider: string, displayName: string }>
-}
-interface CapsGetResponse extends RpcEnvelopeResponse {
-	models?: Record<string, EffectiveCapability>
-}
-interface CapsSetResponse extends RpcEnvelopeResponse {
-	effective?: EffectiveCapability
-}
 interface CapsRequest {
 	token: number
 	promise: Promise<Map<string, EffectiveCapability> | undefined>
-}
-interface RpcEnvelopeResponse {
-	ok?: boolean
-	error?: string
 }
 
 const SCAN_DEBOUNCE_MS = 50
 
 export const name = 'dsh-model-toggles'
-export const inject = ['remote']
+/** `connection` = Host RPC 传输；`remote` = 官方事件流（settings/document-updated）。 */
+export const inject = ['connection', 'remote']
 
 // 注入辅助层的再导出（smoke 直测用）。
 export { CONTROLS_MARKER, removeInjectedControls, scanForEditorControls } from './inject'
@@ -74,13 +64,15 @@ export function apply(ctx: ClientContext): void {
 	}
 
 	const refreshMeta = async (): Promise<void> => {
-		const response = await rpc<MetaRoutesResponse>('meta.routes')
-		if (!response.ok || !Array.isArray(response.routes)) return
+		const result = await rpc<{ routes?: Array<{ provider: string, displayName: string }> }>(ctx.connection, 'meta.routes')
+		if (!result.ok || !Array.isArray(result.value.routes)) return
 		const direct = new Set<string>()
 		const byName = new Map<string, string>()
-		for (const row of response.routes) {
+		for (const row of result.value.routes) {
 			direct.add(row.provider)
-			byName.set(row.displayName, row.provider)
+			const existing = byName.get(row.displayName)
+			if (existing === undefined) byName.set(row.displayName, row.provider)
+			else if (existing !== row.provider) byName.delete(row.displayName) // 同名歧义：宁可不注入，也不写错路由
 		}
 		directory.direct = direct
 		directory.byName = byName
@@ -121,10 +113,10 @@ export function apply(ctx: ClientContext): void {
 
 		const token = (capsTokens.get(route) ?? 0) + 1
 		capsTokens.set(route, token)
-		const promise = rpc<CapsGetResponse>('caps.get', { route }).then(response => {
-			if (!response.ok) return undefined
+		const promise = rpc<{ models?: Record<string, EffectiveCapability> }>(ctx.connection, 'caps.get', { route }).then(result => {
+			if (!result.ok) return undefined
 			const map = new Map<string, EffectiveCapability>()
-			for (const [modelId, caps] of Object.entries(response.models ?? {})) {
+			for (const [modelId, caps] of Object.entries(result.value.models ?? {})) {
 				map.set(modelId, caps)
 			}
 			if (capsTokens.get(route) === token) capsCache.set(route, map)
@@ -151,9 +143,12 @@ export function apply(ctx: ClientContext): void {
 			const key = `${route}\u0000${model}`
 			const previous = toggleQueues.get(key) ?? Promise.resolve()
 			const run = previous.then(async () => {
-				const response = await rpc<CapsSetResponse>('caps.set', { route, model, patch })
-				if (!response.ok) {
-					console.warn(`dsh-model-toggles: ${route}/${model} 写入失败：${response.error ?? '未知错误'}`)
+				const result = await rpc<{ effective?: EffectiveCapability }>(ctx.connection, 'caps.set', { route, model, patch })
+				if (!result.ok) {
+					console.warn(`dsh-model-toggles: ${route}/${model} 写入失败：${result.error.message}`)
+					// 写入失败：勾选框停在用户点击后的假状态 —— 强制回读服务端真相
+					// 并重扫，让控件复位到实际落盘状态。
+					await requestCaps(route, true)
 					return
 				}
 				// caps.set 只回当前模型，绝不能拿它拼一份 route map：那会让同一路由

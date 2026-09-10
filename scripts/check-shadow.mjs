@@ -20,7 +20,9 @@ const root = doc.toJS()
 const liveRoot = root['llm-pi-ai']?.providers ?? {}
 const live = {}
 for (const [route, profile] of Object.entries(liveRoot)) {
-  live[route] = Array.isArray(profile?.models) ? profile.models.map(m => m.id) : []
+  // null = 该路由无显式 models 列表（目录 passthrough）：无法凭列表判定删除，
+  // 模型级核对跳过（插件清理同样保留这类键）。
+  live[route] = Array.isArray(profile?.models) ? profile.models.map(m => m.id) : null
 }
 const shadow = root['model-toggles']?.providers ?? {}
 let bad = 0
@@ -29,6 +31,10 @@ for (const [route, models] of Object.entries(shadow)) {
   if (!(route in live)) {
     console.log(`✘ 无效路由: ${route}`)
     bad += 1
+    continue
+  }
+  if (live[route] === null) {
+    console.log(`✔ ${route} -> ${Object.keys(models).join(', ')}（目录 passthrough，跳过模型级核对）`)
     continue
   }
   for (const m of Object.keys(models)) {
