@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-toggles",
-  "version": "0.2.0",
+  "version": "0.1.5-rc.1.1",
   "private": true,
   "description": "DSH 模型能力勾选插件：在官方模型页每个模型条目里注入「图片输入」与思考强度（最低/低/中/高/超高/最高）勾选，写入 settings.yaml 的 input / reasoningEfforts",
   "type": "module",
