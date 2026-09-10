@@ -70,22 +70,22 @@ try {
   }
   let capsGetCalls = 0
   const rpcCalls = []
-  /** 假 Connection：官方接入面 ctx.connection.rpc.call(channel, endpoint, payload)。 */
+  /** 假 Connection：官方 Api Gateway 通道 `/api`，端点 `<namespace>/<method>`，载荷 `{args}`。 */
   const connection = {
     rpc: {
       async call(channel, endpoint, payload) {
-        if (channel !== '/dsh-model-toggles/rpc') throw new Error(`unexpected RPC channel ${channel}`)
-        rpcCalls.push({ endpoint, payload })
-        if (endpoint === 'meta.routes') {
+        if (channel !== '/api') throw new Error(`unexpected RPC channel ${channel}`)
+        rpcCalls.push({ endpoint, args: payload?.args })
+        if (endpoint === 'modelToggles/metaRoutes') {
           return { ok: true, value: { routes: [{ provider: 'qwen-coding-plan', displayName: 'Qwen Coding Plan' }] } }
         }
-        if (endpoint === 'caps.get') {
+        if (endpoint === 'modelToggles/capsGet') {
           capsGetCalls++
           // 返回 detached data，模拟实际 JSON 边界。
           return { ok: true, value: { models: structuredClone(capabilities) } }
         }
-        if (endpoint === 'caps.set') {
-          const { model, patch } = payload
+        if (endpoint === 'modelToggles/capsSet') {
+          const { model, patch } = payload.args
           capabilities = structuredClone(capabilities)
           if ('image' in patch) capabilities[model].image = patch.image
           if ('efforts' in patch) capabilities[model].efforts = patch.efforts

@@ -64,7 +64,7 @@ export function apply(ctx: ClientContext): void {
 	}
 
 	const refreshMeta = async (): Promise<void> => {
-		const result = await rpc<{ routes?: Array<{ provider: string, displayName: string }> }>(ctx.connection, 'meta.routes')
+		const result = await rpc<{ routes?: Array<{ provider: string, displayName: string }> }>(ctx.connection, 'metaRoutes')
 		if (!result.ok || !Array.isArray(result.value.routes)) return
 		const direct = new Set<string>()
 		const byName = new Map<string, string>()
@@ -113,7 +113,7 @@ export function apply(ctx: ClientContext): void {
 
 		const token = (capsTokens.get(route) ?? 0) + 1
 		capsTokens.set(route, token)
-		const promise = rpc<{ models?: Record<string, EffectiveCapability> }>(ctx.connection, 'caps.get', { route }).then(result => {
+		const promise = rpc<{ models?: Record<string, EffectiveCapability> }>(ctx.connection, 'capsGet', { route }).then(result => {
 			if (!result.ok) return undefined
 			const map = new Map<string, EffectiveCapability>()
 			for (const [modelId, caps] of Object.entries(result.value.models ?? {})) {
@@ -143,7 +143,7 @@ export function apply(ctx: ClientContext): void {
 			const key = `${route}\u0000${model}`
 			const previous = toggleQueues.get(key) ?? Promise.resolve()
 			const run = previous.then(async () => {
-				const result = await rpc<{ effective?: EffectiveCapability }>(ctx.connection, 'caps.set', { route, model, patch })
+				const result = await rpc<{ effective?: EffectiveCapability }>(ctx.connection, 'capsSet', { route, model, patch })
 				if (!result.ok) {
 					console.warn(`dsh-model-toggles: ${route}/${model} 写入失败：${result.error.message}`)
 					// 写入失败：勾选框停在用户点击后的假状态 —— 强制回读服务端真相

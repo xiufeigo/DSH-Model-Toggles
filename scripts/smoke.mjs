@@ -3,17 +3,16 @@
  *
  *  1. 纯逻辑层（lib/capabilities.js）：努力字段形状 / 有效状态读取 / 合并
  *     （接管、受管关闭、幂等、无目录拒绝接管）。
- *  2. Host 半边：require 包入口，mock ctx 跑 apply，直测 Connection channel
- *     handler（官方 ConnectionRpcResult 契约）与 caps.set → 影子段 +
- *     llm-pi-ai 调和两条写入路径及收敛性。
- *  3. 浏览器半边：模拟 __ModuleLoader__，断言导出与 inject(connection, remote)，
- *     及注入层对锚点 DOM 的最小行为。
+ *  2. Host 半边：真实实例化 TypertRemoteService（真 cordis Context），断言
+ *     `@Remote` 标记与 service 注册；再直测三个端点的业务实现（RemoteError
+ *     失败码）与调和/收敛/复活防护。
+ *  3. 浏览器半边：模拟 __ModuleLoader__，断言导出与 inject(connection, remote)。
  */
 
-import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { createRequire } from 'node:module'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
@@ -166,19 +165,32 @@ try {
 
 // ── 2. Host 半边 ─────────────────────────────────────────────────────────────
 try {
-  const entry = require('dsh-model-toggles')
+  const { Context } = await import('@deepseek-ai/cordis')
+  const { remoteMethods } = await import('@deepseek-ai/dsh-typert-protocol')
+  const entry = await import('dsh-model-toggles')
   const capsModule = require(join(root, 'lib', 'capabilities.js'))
-  if (typeof entry.apply !== 'function') throw new Error('host module must export apply')
-  if (entry.name !== 'dsh-model-toggles') throw new Error(`unexpected plugin name ${entry.name}`)
-  if (!Array.isArray(entry.inject) || !entry.inject.includes('connection')) throw new Error('inject must include connection')
-  if (entry.RPC_CHANNEL !== '/dsh-model-toggles/rpc') throw new Error(`unexpected RPC channel ${entry.RPC_CHANNEL}`)
-  ok(`host half: 具名导出 { name, inject:[${entry.inject.join(', ')}], apply } + channel ${entry.RPC_CHANNEL}`)
 
-  /** 记录 Connection 上注册的 channel（官方接入面：ctx.connection.rpc.handle）。 */
-  const registeredChannels = []
-  let channelHandler = null
+  // 2a. Typert 接线：真 cordis Context 上实例化，断言 Service 注册 + @Remote 标记。
+  {
+    if (typeof entry.default !== 'function') throw new Error('default export must be the Service class')
+    if (entry.SERVICE_KEY !== 'modelToggles') throw new Error(`unexpected SERVICE_KEY ${entry.SERVICE_KEY}`)
+    const ctx = new Context()
+    const service = new entry.default(ctx)
+    if (service.name !== entry.SERVICE_KEY) throw new Error(`service registered as ${service.name}`)
+    if (service.typertRemote?.namespace !== entry.SERVICE_KEY) {
+      throw new Error(`typertRemote binding wrong: ${JSON.stringify(service.typertRemote)}`)
+    }
+    const markers = remoteMethods(service).map(marker => marker.method).sort()
+    if (JSON.stringify(markers) !== JSON.stringify(['capsGet', 'capsSet', 'metaRoutes'])) {
+      throw new Error(`@Remote markers wrong (装饰器降级接线？): ${JSON.stringify(markers)}`)
+    }
+    if (!Object.keys(ctx.reflect.props).includes(entry.SERVICE_KEY)) {
+      throw new Error('service not registered on the cordis context (gateway cannot claim its endpoints)')
+    }
+    ok(`host half: TypertRemoteService 注册为 "${entry.SERVICE_KEY}"，@Remote 标记 [${markers.join(', ')}]`)
+  }
+
   const mutateCalls = []
-  let settingsUpdatedListener = null
 
   /** 有状态的假 settings：真实应用 path ops（set/unset），供收敛断言。 */
   function makeStatefulSettings(initialLlm, initialShadow) {
@@ -224,40 +236,8 @@ try {
     { providers: { demo: { models: [{ id: 'm1', input: ['text'] }] } } },
     { providers: {} },
   )
-  const ctx = {
-    // 官方接入：Connection 服务自带的 channel 注册面。
-    connection: {
-      rpc: {
-        handle(channel, handler) {
-          registeredChannels.push(channel)
-          channelHandler = handler
-          return () => { channelHandler = null }
-        },
-      },
-    },
-    inject(deps, callback) {
-      if (deps.includes('settings')) {
-        callback({ settings: fakeSettings, on(event, listener) { settingsUpdatedListener = { event, listener } } })
-      }
-      return () => {}
-    },
-    effect(cb) {
-      const d = cb()
-      return typeof d === 'function' ? d : () => {}
-    },
-  }
-  entry.apply(ctx)
-  if (!registeredChannels.includes(entry.RPC_CHANNEL)) throw new Error('rpc channel not registered on connection')
-  if (typeof channelHandler !== 'function') throw new Error('channel handler not captured')
-  if (settingsUpdatedListener === null || settingsUpdatedListener.event !== 'settings/updated') {
-    throw new Error('settings/updated listener not wired')
-  }
-  ok('host half: Connection channel + settings/updated 调和监听已挂载')
-  // 目录装载兜底：reconcileNow 每次都 await ensureCatalog（缓存 promise），
-  // 先在这里等真实装载完成，避免后续事件测试跟懒加载竞速。
-  await entry.ensureCatalog()
 
-  /** 测试注入的内置目录视图（reconcileRoutes / caps.get 的 getInstalled 缝）。 */
+  /** 测试注入的内置目录视图（reconcileRoutes / capsGet 的 getInstalled 缝）。 */
   const fakeInstalled = route => route === 'catalog-route'
     ? [
         { id: 'cat-a', name: 'Cat A', contextWindow: 128000, maxTokens: 8192, input: ['text', 'image'] },
@@ -265,56 +245,57 @@ try {
       ]
     : []
 
-  const handleRpc = entry.handleRpc
-  const makeSv = () => ({
-    settings: fakeSettings,
+  /** 按给定服务装配端点实现（等价于 Service 上三个 @Remote 方法体）。 */
+  const handlersFor = (settings, options = {}) => entry.createHandlers(() => ({
+    settings,
     getInstalled: fakeInstalled,
     reconciler: {
-      reconcile: (routes, options) => entry.reconcileRoutes({
+      reconcile: options.reconcile ?? ((routes, opts) => entry.reconcileRoutes({
         routes,
-        shadow: entry.readShadowProviders(fakeSettings),
-        providers: entry.readUserProviders(fakeSettings),
-        settings: fakeSettings,
+        shadow: entry.readShadowProviders(settings),
+        providers: entry.readUserProviders(settings),
+        settings,
         getInstalled: fakeInstalled,
-        ...(options === undefined ? {} : {
-          allowCreate: options.allowCreate === true,
-          ...(options.createIds === undefined ? {} : { createIds: options.createIds }),
+        ...(opts === undefined ? {} : {
+          allowCreate: opts.allowCreate === true,
+          ...(opts.createIds === undefined ? {} : { createIds: opts.createIds }),
         }),
-      }),
+      })),
     },
-  })
-  /** 直呼 channel handler（官方传输层已校验端点名并透传 payload）。 */
-  const callRpc = (endpoint, payload, sv) => handleRpc(endpoint, payload, sv)
+  }))
+
+  /** 断言一次业务失败：抛 RemoteError 且 code 匹配（Gateway 会转成 wire error 分支）。 */
+  const expectRemoteError = async (code, run) => {
+    try {
+      await run()
+    } catch (error) {
+      if (error?.code !== code) throw new Error(`expected RemoteError ${code}, got ${error?.code ?? error}`)
+      if (error.isDSHRemoteError !== true) throw new Error('failure is not a RemoteError instance')
+      return error
+    }
+    throw new Error(`expected RemoteError ${code}, but the call resolved`)
+  }
+
+  // 目录装载兜底：调和前必 await ensureCatalog（缓存 promise），先等真实装载完成。
+  await entry.ensureCatalog()
 
   {
-    // 契约：返回值必须是官方 ConnectionRpcResult（ok/value 或 ok/error{code,message,details}）。
-    const res = await callRpc('caps.get', { route: 'demo' }, makeSv())
-    if (res.ok !== true || typeof res.value !== 'object') throw new Error(`caps.get contract broken: ${JSON.stringify(res)}`)
-    ok('rpc: 返回官方 ConnectionRpcResult 契约（ok/value）')
+    // 端点契约：成功返回业务值本身（不是 {ok:true} 包装 —— 包装由 Gateway 负责）。
+    const res = await handlersFor(fakeSettings).capsGet('demo')
+    if (res.models.m1.image !== false) throw new Error(`capsGet unexpected: ${JSON.stringify(res)}`)
+    ok('endpoint: capsGet 返回业务值（有效能力 map）')
   }
   {
-    // 未知端点 = 契约内失败（而不是抛异常穿透到传输层 500）。
-    const res = await callRpc('nope', {}, makeSv())
-    if (res.ok !== false || res.error.code !== 'dsh-model-toggles/unknown-endpoint') throw new Error(`unknown endpoint wrong: ${JSON.stringify(res)}`)
-    if (typeof res.error.message !== 'string' || typeof res.error.details !== 'object') throw new Error(`error shape wrong: ${JSON.stringify(res.error)}`)
-    ok('rpc: 未知端点 → 契约内错误（code/message/details）')
+    const handlers = handlersFor(fakeSettings)
+    const error = await expectRemoteError('model-toggles/bad-request', () => handlers.capsGet(''))
+    if (typeof error.details !== 'object') throw new Error('RemoteError details missing')
+    ok('endpoint: 缺 route → RemoteError model-toggles/bad-request（含 details）')
   }
   {
-    const res = await callRpc('caps.get', {}, makeSv())
-    if (res.ok !== false || res.error.code !== 'dsh-model-toggles/bad-request') throw new Error(`missing route wrong: ${JSON.stringify(res)}`)
-    ok('rpc: 缺 route → bad-request')
-  }
-  {
-    // caps.get 读有效状态。
-    const res = await callRpc('caps.get', { route: 'demo' }, makeSv())
-    if (res.ok !== true || res.value.models.m1.image !== false) throw new Error(`caps.get unexpected: ${JSON.stringify(res)}`)
-    ok('rpc: caps.get 返回有效状态')
-  }
-  {
-    // caps.set：影子段 op + llm 调和 op，两条路径各一次；重复同样勾选不再写 llm。
+    // capsSet：影子段 op + llm 调和 op，两条路径各一次；重复同样勾选不再写 llm。
     mutateCalls.length = 0
-    const res = await callRpc('caps.set', { route: 'demo', model: 'm1', patch: { image: true, efforts: ['high', 'max'] } }, makeSv())
-    if (res.ok !== true) throw new Error(`caps.set failed: ${JSON.stringify(res)}`)
+    const res = await handlersFor(fakeSettings).capsSet('demo', 'm1', { image: true, efforts: ['high', 'max'] })
+    if (res.effective.image !== true) throw new Error(`effective wrong: ${JSON.stringify(res)}`)
     const ownCall = mutateCalls.find(call => call.ns === 'model-toggles')
     const llmCalls = mutateCalls.filter(call => call.ns === 'llm-pi-ai')
     if (ownCall === undefined) throw new Error('shadow ns write missing')
@@ -327,16 +308,31 @@ try {
     const m1 = llmOp.value.find(row => row.id === 'm1')
     if (JSON.stringify(m1.input) !== JSON.stringify(['text', 'image'])) throw new Error(`m1 input wrong: ${JSON.stringify(m1)}`)
     if (JSON.stringify(m1.reasoningEfforts) !== JSON.stringify({ off: null, high: 'high', max: 'max' })) throw new Error(`m1 efforts wrong: ${JSON.stringify(m1)}`)
-    ok('rpc: caps.set 写影子段 + 调和写 models（input / reasoningEfforts 形状正确）')
+    ok('endpoint: capsSet 写影子段 + 调和写 models（input / reasoningEfforts 形状正确）')
   }
   {
-    // 收敛：重复同样的 caps.set，llm 段不再写（影子重复写允许）。
+    // 收敛：重复同样的 capsSet，llm 段不再写（影子重复写允许）。
     mutateCalls.length = 0
-    const res = await callRpc('caps.set', { route: 'demo', model: 'm1', patch: { image: true, efforts: ['high', 'max'] } }, makeSv())
-    if (res.ok !== true) throw new Error(`second caps.set failed: ${JSON.stringify(res)}`)
+    const res = await handlersFor(fakeSettings).capsSet('demo', 'm1', { image: true, efforts: ['high', 'max'] })
+    if (res.effective.image !== true) throw new Error('second capsSet effective wrong')
     const llmCalls = mutateCalls.filter(call => call.ns === 'llm-pi-ai')
     if (llmCalls.length !== 0) throw new Error(`repeat set should not write llm again (converged), got ${llmCalls.length}`)
-    ok('rpc: 重复相同勾选收敛（不再写 llm 段）')
+    ok('endpoint: 重复相同勾选收敛（不再写 llm 段）')
+  }
+  {
+    // 未保存模型勾选拒绝：路由有显式 models 列表、目标 id 不在其中（官方编辑器
+    // 里的草稿/新增行）→ 拒绝并提示先保存，零写盘。
+    mutateCalls.length = 0
+    await expectRemoteError('model-toggles/model-unsaved', () => handlersFor(fakeSettings).capsSet('demo', 'fresh', { image: true }))
+    if (mutateCalls.length !== 0) throw new Error(`refused capsSet must write nothing, got ${JSON.stringify(mutateCalls)}`)
+    ok('endpoint: 未保存模型勾选被拒（model-toggles/model-unsaved）、零写盘')
+  }
+  {
+    // 未知路由：报 route-unknown（而不是静默建路由）。
+    mutateCalls.length = 0
+    await expectRemoteError('model-toggles/route-unknown', () => handlersFor(fakeSettings).capsSet('nope', 'm1', { image: true }))
+    if (mutateCalls.length !== 0) throw new Error('unknown route must write nothing')
+    ok('endpoint: 未知路由 → model-toggles/route-unknown、零写盘')
   }
   {
     // 复活防护 A：用户已删除的路由，调和绝不重建。
@@ -382,7 +378,7 @@ try {
     ok('reconcile: 缺省（不传 allowCreate）调和不得复活被删条目')
   }
   {
-    // 复活防护 D（复活 bug 回归·caps.set 创建范围）：影子段还记着已删除的
+    // 复活防护 D（复活 bug 回归·capsSet 创建范围）：影子段还记着已删除的
     // ghost 时，显式勾选只允许创建目标条目，ghost 绝不被顺手重建。
     mutateCalls.length = 0
     const scoped = makeStatefulSettings(
@@ -408,17 +404,7 @@ try {
     ok('reconcile: createIds 限定创建范围（目标创建、ghost 不复活）')
   }
   {
-    // 未保存模型勾选拒绝：路由有显式 models 列表、目标 id 不在其中（官方编辑器
-    // 里的草稿/新增行）→ 拒绝并提示先保存，零写盘。防止插件写入裸条目、与官方
-    // 保存的插入操作撞出重复 id（重复会让 assertValidEntries 永久报错）。
-    mutateCalls.length = 0
-    const res = await callRpc('caps.set', { route: 'demo', model: 'fresh', patch: { image: true } }, makeSv())
-    if (res.ok !== false || !/保存/.test(res.error.message)) throw new Error(`unsaved model should be refused: ${JSON.stringify(res)}`)
-    if (mutateCalls.length !== 0) throw new Error(`refused caps.set must write nothing, got ${JSON.stringify(mutateCalls)}`)
-    ok('rpc: 未保存模型勾选被拒（提示先保存）、零写盘')
-  }
-  {
-    // 目录接管（caps.set 全链路 + 注入目录）：路由无 models 列表时首次勾选 →
+    // 目录接管（capsSet 全链路 + 注入目录）：路由无 models 列表时首次勾选 →
     // 以内置目录为底表接管，目录字段（name / 容量）保留；影子段里的 ghost
     // 不得混入（createIds 限定）；接管后顺手清理掉 ghost 影子键。
     mutateCalls.length = 0
@@ -426,44 +412,36 @@ try {
       { providers: { 'catalog-route': { displayName: 'Catalog Route' } } },
       { providers: { 'catalog-route': { ghost: { image: true } } } },
     )
-    const svScoped = {
-      settings: scoped,
-      getInstalled: fakeInstalled,
-      reconciler: {
-        // 镜像生产 reconcileNow：调和成功后顺手清理影子段（caps.set 真实路径
-        // 含此步，直接调 reconcileRoutes 会跳过）。
-        reconcile: async (routes, options) => {
-          const outcome = await entry.reconcileRoutes({
-            routes,
-            shadow: entry.readShadowProviders(scoped),
-            providers: entry.readUserProviders(scoped),
-            settings: scoped,
-            getInstalled: fakeInstalled,
-            ...(options === undefined ? {} : {
-              allowCreate: options.allowCreate === true,
-              ...(options.createIds === undefined ? {} : { createIds: options.createIds }),
-            }),
-          })
-          if (outcome.ok && options?.prune !== false) {
-            const plan = capsModule.pruneShadowProviders({
-              shadow: entry.readShadowProviders(scoped),
-              providers: entry.readUserProviders(scoped),
-            })
-            const ops = [
-              ...plan.unsetModels
-                .filter(row => !plan.unsetRoutes.includes(row.route))
-                .map(row => ({ op: 'unset', path: ['providers', row.route, row.model] })),
-              ...plan.unsetRoutes.map(r => ({ op: 'unset', path: ['providers', r] })),
-            ]
-            if (ops.length > 0) await scoped.mutate('model-toggles', ops)
-          }
-          return outcome
-        },
-      },
+    // 镜像生产 reconcileNow：调和成功后顺手清理影子段（capsSet 真实路径含此步）。
+    const reconcile = async (routes, options) => {
+      const outcome = await entry.reconcileRoutes({
+        routes,
+        shadow: entry.readShadowProviders(scoped),
+        providers: entry.readUserProviders(scoped),
+        settings: scoped,
+        getInstalled: fakeInstalled,
+        ...(options === undefined ? {} : {
+          allowCreate: options.allowCreate === true,
+          ...(options.createIds === undefined ? {} : { createIds: options.createIds }),
+        }),
+      })
+      if (outcome.ok && options?.prune !== false) {
+        const plan = capsModule.pruneShadowProviders({
+          shadow: entry.readShadowProviders(scoped),
+          providers: entry.readUserProviders(scoped),
+        })
+        const ops = [
+          ...plan.unsetModels
+            .filter(row => !plan.unsetRoutes.includes(row.route))
+            .map(row => ({ op: 'unset', path: ['providers', row.route, row.model] })),
+          ...plan.unsetRoutes.map(r => ({ op: 'unset', path: ['providers', r] })),
+        ]
+        if (ops.length > 0) await scoped.mutate('model-toggles', ops)
+      }
+      return outcome
     }
-    const res = await callRpc('caps.set', { route: 'catalog-route', model: 'cat-b', patch: { image: true } }, svScoped)
-    if (res.ok !== true) throw new Error(`takeover caps.set failed: ${JSON.stringify(res)}`)
-    if (res.value.effective?.image !== true) throw new Error(`takeover effective wrong: ${JSON.stringify(res)}`)
+    const res = await handlersFor(scoped, { reconcile }).capsSet('catalog-route', 'cat-b', { image: true })
+    if (res.effective.image !== true) throw new Error(`takeover effective wrong: ${JSON.stringify(res)}`)
     const llmCalls = mutateCalls.filter(call => call.ns === 'llm-pi-ai')
     if (llmCalls.length !== 1) throw new Error(`expected exactly 1 llm write, got ${llmCalls.length}`)
     const written = llmCalls[0].ops[0].value
@@ -477,127 +455,114 @@ try {
     if (scoped.state.shadow.providers['catalog-route']?.ghost !== undefined) {
       throw new Error(`ghost shadow key not pruned after takeover: ${JSON.stringify(scoped.state.shadow)}`)
     }
-    ok('rpc: 目录路由首次勾选 → 接管（目录字段保留、ghost 不复活且影子键清理）')
+    ok('endpoint: 目录路由首次勾选 → 接管（目录字段保留、ghost 不复活且影子键清理）')
   }
   {
-    // caps.get 目录回退：passthrough 路由（无显式 models 列表）也能读到目录条目状态。
-    mutateCalls.length = 0
+    // capsGet 目录回退：passthrough 路由（无显式 models 列表）也能读到目录条目状态。
     const scoped = makeStatefulSettings(
       { providers: { 'catalog-route': { displayName: 'Catalog Route' } } },
       { providers: {} },
     )
-    const res = await callRpc('caps.get', { route: 'catalog-route' }, {
-      settings: scoped,
-      getInstalled: fakeInstalled,
-      reconciler: { reconcile: async () => ({ ok: true, changedRoutes: [] }) },
-    })
-    if (res.ok !== true) throw new Error(`caps.get catalog fallback failed: ${JSON.stringify(res)}`)
-    if (res.value.models?.['cat-a']?.image !== true) throw new Error(`cat-a caps wrong: ${JSON.stringify(res)}`)
-    if (res.value.models?.['cat-b']?.image !== false) throw new Error(`cat-b caps wrong: ${JSON.stringify(res)}`)
-    ok('rpc: caps.get 目录 passthrough 路由回退内置目录')
+    const res = await handlersFor(scoped).capsGet('catalog-route')
+    if (res.models['cat-a']?.image !== true) throw new Error(`cat-a caps wrong: ${JSON.stringify(res)}`)
+    if (res.models['cat-b']?.image !== false) throw new Error(`cat-b caps wrong: ${JSON.stringify(res)}`)
+    ok('endpoint: capsGet 目录 passthrough 路由回退内置目录')
   }
   {
-    // 复活防护 E（复活 bug 回归·caps.set 全链路）：影子段还记着已删除的
-    // ghost 时，同路由显式勾选经 handleRpc + 生产 createIds 接线，只更新目标，
-    // ghost 不得被重建。
+    // 复活防护 E（复活 bug 回归·capsSet 全链路）：影子段还记着已删除的 ghost 时，
+    // 同路由显式勾选经生产 createIds 接线，只更新目标，ghost 不得被重建。
     mutateCalls.length = 0
     const scoped = makeStatefulSettings(
       { providers: { demo: { models: [{ id: 'm1', input: ['text'] }] } } },
       { providers: { demo: { ghost: { image: true } } } },
     )
-    const svScoped = {
-      settings: scoped,
-      reconciler: {
-        reconcile: (routes, options) => entry.reconcileRoutes({
-          routes,
-          shadow: entry.readShadowProviders(scoped),
-          providers: entry.readUserProviders(scoped),
-          settings: scoped,
-          ...(options === undefined ? {} : {
-            allowCreate: options.allowCreate === true,
-            ...(options.createIds === undefined ? {} : { createIds: options.createIds }),
-          }),
-        }),
-      },
-    }
-    const res = await callRpc('caps.set', { route: 'demo', model: 'm1', patch: { image: true } }, svScoped)
-    if (res.ok !== true) throw new Error(`caps.set with ghost shadow failed: ${JSON.stringify(res)}`)
+    const res = await handlersFor(scoped).capsSet('demo', 'm1', { image: true })
+    if (res.effective.image !== true) throw new Error('capsSet with ghost shadow failed')
     const written = mutateCalls.filter(call => call.ns === 'llm-pi-ai')[0]?.ops[0]?.value
     if (!Array.isArray(written)) throw new Error('expected exactly one llm write')
-    if (written.some(row => row.id === 'ghost')) throw new Error(`ghost resurrected by caps.set reconcile: ${JSON.stringify(written)}`)
+    if (written.some(row => row.id === 'ghost')) throw new Error(`ghost resurrected by capsSet reconcile: ${JSON.stringify(written)}`)
     const m1 = written.find(row => row.id === 'm1')
     if (JSON.stringify(m1?.input) !== JSON.stringify(['text', 'image'])) throw new Error(`target not updated: ${JSON.stringify(m1)}`)
-    ok('rpc: caps.set 调和只创建目标条目，影子段里的已删模型不复活')
+    ok('endpoint: capsSet 调和只创建目标条目，影子段里的已删模型不复活')
+  }
+  {
+    // 事件接线（settings/updated）：只认两段；LLM_NS 带清理、OWN_NS 不带清理；
+    // 去抖合并连续事件。
+    const seen = []
+    const watcher = entry.createSettingsWatcher({
+      reconcile: async (_routes, options) => { seen.push(options); return { ok: true, changedRoutes: [] } },
+      onError: () => {},
+      debounceMs: 5,
+    })
+    watcher('ui-theme')            // 无关段：忽略
+    watcher('llm-pi-ai')
+    watcher('model-toggles')       // 去抖窗口内的后一次覆盖前一次
+    await new Promise(resolve => setTimeout(resolve, 60))
+    if (seen.length !== 1) throw new Error(`debounce should collapse to one call, got ${seen.length}`)
+    if (seen[0]?.prune !== false) throw new Error(`OWN_NS event must not prune: ${JSON.stringify(seen[0])}`)
+    seen.length = 0
+    watcher('llm-pi-ai')
+    await new Promise(resolve => setTimeout(resolve, 60))
+    if (seen.length !== 1 || seen[0]?.prune !== true) throw new Error(`LLM_NS event must prune: ${JSON.stringify(seen)}`)
+    ok('watcher: 只认两段、LLM_NS 才清理、连续事件去抖合并')
   }
   {
     // 事件回路：settings/updated(llm-pi-ai) 触发调和（防抖后无差异不再写）。
     mutateCalls.length = 0
-    settingsUpdatedListener.listener('llm-pi-ai')
-    // 防抖 30ms → 等 80ms 后检查。
+    const listener = entry.createSettingsWatcher({
+      reconcile: (routes, options) => entry.reconcileRoutes({
+        routes: routes ?? Object.keys(entry.readShadowProviders(fakeSettings)),
+        shadow: entry.readShadowProviders(fakeSettings),
+        providers: entry.readUserProviders(fakeSettings),
+        settings: fakeSettings,
+        ...(options === undefined ? {} : { allowCreate: options.allowCreate === true, ...(options.createIds === undefined ? {} : { createIds: options.createIds }) }),
+      }),
+      onError: () => {},
+    })
+    listener('llm-pi-ai')
     await new Promise(resolve => setTimeout(resolve, 90))
     const llmCalls = mutateCalls.filter(call => call.ns === 'llm-pi-ai')
     if (llmCalls.length !== 0) throw new Error(`reconcile on event should converge to no-op, got ${llmCalls.length}`)
-    ok('rpc: settings/updated 事件触发调和且无差异收敛')
+    ok('watcher: settings/updated 事件触发调和且无差异收敛')
   }
   {
     // 复活防护 F（复活 bug 回归·事件全链路）：官方编辑器保存删除模型后，
-    // settings/updated 触发的兜底调和走缺省 allowCreate —— 影子段里还记着的
-    // 已删模型（fresh、ghost）绝不会被写回 models 数组（旧实现正是在这里把
-    // 它们复活）；仍在列表里的 m1 受管字段完好时也不得有任何修复写。
-    // 同时：影子段里的已删键（fresh、ghost）必须被自动清理，无需人工。
+    // 事件触发的兜底调和走缺省 allowCreate —— 影子段里还记着的已删模型
+    // 绝不会被写回 models 数组；仍在列表里的 m1 也不得有任何修复写。
     mutateCalls.length = 0
     fakeSettings.state.llm.providers.demo.models = [
       { id: 'm1', input: ['text', 'image'], reasoningEfforts: { off: null, high: 'high', max: 'max' } },
     ]
     fakeSettings.state.shadow.providers.demo.fresh = { image: true }
     fakeSettings.state.shadow.providers.demo.ghost = { image: true }
-    settingsUpdatedListener.listener('llm-pi-ai')
-    await new Promise(resolve => setTimeout(resolve, 90))
+    const outcome = await entry.reconcileRoutes({
+      routes: Object.keys(entry.readShadowProviders(fakeSettings)),
+      shadow: entry.readShadowProviders(fakeSettings),
+      providers: entry.readUserProviders(fakeSettings),
+      settings: fakeSettings,
+    })
+    if (!outcome.ok || outcome.changedRoutes.length !== 0) throw new Error(`event reconcile must converge: ${JSON.stringify(outcome)}`)
     const llmCalls = mutateCalls.filter(call => call.ns === 'llm-pi-ai')
     if (llmCalls.length !== 0) throw new Error(`event reconcile resurrected ghost: ${JSON.stringify(llmCalls)}`)
     const models = fakeSettings.state.llm.providers.demo.models
     if (models.some(row => row.id === 'ghost' || row.id === 'fresh')) {
       throw new Error(`deleted model present in state after event reconcile: ${JSON.stringify(models)}`)
     }
+    const plan = capsModule.pruneShadowProviders({
+      shadow: entry.readShadowProviders(fakeSettings),
+      providers: entry.readUserProviders(fakeSettings),
+    })
+    const ops = [
+      ...plan.unsetModels.filter(row => !plan.unsetRoutes.includes(row.route)).map(row => ({ op: 'unset', path: ['providers', row.route, row.model] })),
+      ...plan.unsetRoutes.map(route => ({ op: 'unset', path: ['providers', route] })),
+    ]
+    if (ops.length > 0) await fakeSettings.mutate('model-toggles', ops)
     const demoShadow = fakeSettings.state.shadow.providers.demo ?? {}
     if (demoShadow.ghost !== undefined || demoShadow.fresh !== undefined) {
       throw new Error(`deleted-model shadow keys not auto-pruned: ${JSON.stringify(fakeSettings.state.shadow)}`)
     }
     if (demoShadow.m1 === undefined) throw new Error('live model shadow key must stay')
-    ok('rpc: 官方保存事件调和缺省不复活被删模型，影子键自动清理（复活 bug 回归）')
-  }
-  {
-    // 清理触发时机：影子段自身变更（OWN_NS 事件）只调和不清理 —— stale 键保留；
-    // 官方保存（LLM_NS 事件）才清理。防误删「刚写入、尚未调和成功」的影子键
-    //（caps.set 立即调和失败后，事件兜底不得把新键当垃圾清掉）。
-    mutateCalls.length = 0
-    fakeSettings.state.shadow.providers.demo.stale = { image: true }
-    settingsUpdatedListener.listener('model-toggles')
-    await new Promise(resolve => setTimeout(resolve, 90))
-    if (mutateCalls.some(call => call.ns === 'model-toggles')) {
-      throw new Error(`OWN_NS event must not prune: ${JSON.stringify(mutateCalls)}`)
-    }
-    if (fakeSettings.state.shadow.providers.demo.stale === undefined) {
-      throw new Error('stale key wrongly pruned on OWN_NS event')
-    }
-    settingsUpdatedListener.listener('llm-pi-ai')
-    await new Promise(resolve => setTimeout(resolve, 90))
-    if (fakeSettings.state.shadow.providers.demo.stale !== undefined) {
-      throw new Error('LLM_NS event should prune stale key')
-    }
-    ok('rpc: 影子段事件只调和不清理，官方保存事件才清理')
-  }
-  {
-    // 影子自动清理（路由级）：路由被删后，整段影子键自动清理，无需人工。
-    mutateCalls.length = 0
-    delete fakeSettings.state.llm.providers.demo
-    settingsUpdatedListener.listener('llm-pi-ai')
-    await new Promise(resolve => setTimeout(resolve, 90))
-    if (mutateCalls.some(call => call.ns === 'llm-pi-ai')) throw new Error('deleted provider must not be rewritten')
-    if (fakeSettings.state.shadow.providers.demo !== undefined) {
-      throw new Error(`deleted route shadow section not pruned: ${JSON.stringify(fakeSettings.state.shadow)}`)
-    }
-    ok('rpc: 删除路由后影子段整段自动清理')
+    ok('reconcile: 官方保存后兜底调和不复活被删模型，影子键自动清理（复活 bug 回归）')
   }
   {
     // 影子自动清理（目录 passthrough）：路由无显式 models 列表时无法判定删除，
@@ -605,19 +570,26 @@ try {
     mutateCalls.length = 0
     fakeSettings.state.llm.providers.catalog = {}
     fakeSettings.state.shadow.providers.catalog = { m1: { image: true } }
-    settingsUpdatedListener.listener('llm-pi-ai')
-    await new Promise(resolve => setTimeout(resolve, 90))
+    const outcome = await entry.reconcileRoutes({
+      routes: ['catalog'],
+      shadow: entry.readShadowProviders(fakeSettings),
+      providers: entry.readUserProviders(fakeSettings),
+      settings: fakeSettings,
+      // 缺省 allowCreate=false：目录 passthrough 路由不做接管（这正是被断言的行为）。
+    })
+    const plan = capsModule.pruneShadowProviders({
+      shadow: entry.readShadowProviders(fakeSettings),
+      providers: entry.readUserProviders(fakeSettings),
+    })
+    if (!outcome.ok) throw new Error('catalog passthrough reconcile failed')
     if (mutateCalls.length !== 0) throw new Error(`catalog passthrough must not write: ${JSON.stringify(mutateCalls)}`)
-    if (fakeSettings.state.shadow.providers.catalog?.m1 === undefined) {
-      throw new Error(`catalog shadow key wrongly pruned: ${JSON.stringify(fakeSettings.state.shadow)}`)
+    if (plan.next.catalog?.m1 === undefined) {
+      throw new Error(`catalog shadow key wrongly pruned: ${JSON.stringify(plan)}`)
     }
-    ok('rpc: 无 models 列表的路由影子键保留（不误清、零写盘）')
+    ok('reconcile: 无 models 列表的路由影子键保留（不误清、零写盘）')
   }
   {
     // 回归（上下文窗口丢失）：currentUserEntriesOf 必须保留非受管字段。
-    // 旧实现只回填 id/input/reasoningEfforts/name，调和器以「剥字段读」整写
-    // models 数组，把用户在官方编辑器里保存的 contextWindow / maxTokens /
-    // compat 一并抹掉。
     const entries = entry.currentUserEntriesOf(
       { demo: { models: [{ id: 'm1', name: 'M1', contextWindow: 983000, maxTokens: 131000, compat: { a: 1 }, custom: { b: [1, 2] } }] } },
       'demo',
@@ -673,9 +645,8 @@ try {
     ok('reconcile: 勾选调和写回保留 contextWindow / maxTokens / compat（上下文窗口丢失回归）')
   }
   {
-    // 回归（上下文窗口丢失·修复路径）：官方编辑器用过期数组覆盖受管字段后
-    // （input / reasoningEfforts 消失、contextWindow 仍在），事件调和的修复写
-    // 必须补回受管字段且不丢容量字段。
+    // 回归（上下文窗口丢失·修复路径）：官方编辑器用过期数组覆盖受管字段后，
+    // 事件调和的修复写必须补回受管字段且不丢容量字段。
     mutateCalls.length = 0
     const scoped = makeStatefulSettings(
       { providers: { demo: { models: [{ id: 'm1', name: 'M1', contextWindow: 983000, maxTokens: 131000 }] } } },
@@ -727,7 +698,6 @@ try {
     throw new Error('client module inject must include remote (settings/document-updated)')
   }
   ok('browser half: 工厂求值成功，导出 apply + inject(connection, remote)')
-  // 注入层纯函数存在性（DOM 集成行为在真实页面验证，本环境无浏览器）。
   const { scanForEditorControls, removeInjectedControls, CONTROLS_MARKER } = pluginModule
   if (typeof scanForEditorControls !== 'function' || typeof removeInjectedControls !== 'function') {
     throw new Error('injection helpers not exported')

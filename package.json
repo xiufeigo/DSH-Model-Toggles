@@ -39,12 +39,14 @@
     "plugin:uninstall": "node scripts/uninstall.mjs"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-typert-protocol": "0.1.5-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
     "@types/node": "^22.10.0",
     "@types/react": "~18.3.1",
     "jsdom": "^30.0.1",

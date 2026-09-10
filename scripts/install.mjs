@@ -187,20 +187,19 @@ const probe = async (url, init) => {
 if (DRY) {
 	log('  [dry-run] 跳过线上验证')
 } else {
-	// Host channel：注册在 /dsh-model-toggles/rpc 下，由 Connection 统一挂载并
-	// 施加 Host/Origin 闸门与浏览器会话鉴权。脚本没有会话 cookie，因此
-	// **401 = 路由已挂载且鉴权生效**（这正是期望），200 只可能出现在更早的
-	// 未鉴权版本上；403 = 信任闸门拒绝；404 = 未挂载。
-	const rpcProbe = await probe(`${base}/dsh-model-toggles/rpc/meta.routes`, {
+	// Remote 端点：Host 半边是 TypertRemoteService，`@Remote` 方法由 Api Gateway
+	// 的 collectSrcClaims() 自动认领到共享 `/api` 上。脚本没有会话 cookie，因此
+	// **401 = 端点已挂载且连接鉴权生效**（这正是期望），404 = Gateway 未认领。
+	const rpcProbe = await probe(`${base}/api/modelToggles/metaRoutes`, {
 		method: 'POST',
 		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ type: 'client-request', rpcId: 'install-check', method: 'meta.routes', payload: {} }),
+		body: JSON.stringify({ type: 'client-request', rpcId: 'install-check', method: 'modelToggles/metaRoutes', payload: { args: {} } }),
 	})
 	if (rpcProbe === undefined) log(`  △ 无法访问 ${base}：请重启 dsh web 后验证`)
-	else if (rpcProbe.status === 401) log(`  ✓ Host RPC channel 已挂载且受连接鉴权保护（${base}/dsh-model-toggles/rpc）`)
-	else if (rpcProbe.status === 200) log('  ✓ Host RPC channel 已挂载（未鉴权响应：DSH 较旧）')
+	else if (rpcProbe.status === 401) log(`  ✓ Remote 端点已挂载且受连接鉴权保护（${base}/api/modelToggles/metaRoutes）`)
+	else if (rpcProbe.status === 200) log('  ✓ Remote 端点已挂载（未鉴权响应：DSH 较旧）')
 	else if (rpcProbe.status === 403) log('  △ 信任闸门拒绝脚本请求（Host/Origin）——浏览器同源访问不受影响')
-	else log(`  △ RPC channel 返回 ${rpcProbe.status}：若为首次安装，请重启 dsh web`)
+	else log(`  △ Remote 端点返回 ${rpcProbe.status}：若为首次安装，请重启 dsh web`)
 
 	const bundle = await probe(`${base}/plugins/${ROW_ID}/client.js`)
 	if (bundle !== undefined && bundle.status === 200 && bundle.text.includes('__ModuleLoader__')) {
